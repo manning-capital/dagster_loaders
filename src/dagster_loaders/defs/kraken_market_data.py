@@ -9,6 +9,8 @@ from dagster import (
     ConfigurableResource,
     Definitions,
     EnvVar,
+    MaterializeResult,
+    MetadataValue,
     ScheduleDefinition,
     asset,
     define_asset_job,
@@ -84,9 +86,10 @@ def _kraken_provider_asset_map(
 )
 def kraken_provider_asset_market(
     context: AssetExecutionContext, postgres: PostgresResource
-) -> None:
+) -> MaterializeResult:
     as_of = dt.date.today()
     engine = postgres.get_engine()
+    skipped_pairs: list[str] = []
     try:
         provider_id, asset_map = _kraken_provider_asset_map(engine, as_of)
         context.log.info(f"Loaded {len(asset_map)} Kraken provider assets")
@@ -131,10 +134,19 @@ def kraken_provider_asset_market(
                 frames.append(df)
             except Exception as e:
                 context.log.error(f"Skipping pair {code}: {e}")
+                skipped_pairs.append(code)
 
         if not frames:
             context.log.info("No rows to write.")
-            return
+            return MaterializeResult(
+                metadata={
+                    "row_count": 0,
+                    "pair_count": len(pairs),
+                    "skipped_pairs": MetadataValue.json(skipped_pairs),
+                    "table": ProviderAssetMarket.__tablename__,
+                    "as_of": MetadataValue.text(as_of.isoformat()),
+                }
+            )
 
         data = pd.concat(frames, ignore_index=True)
         data = data.drop_duplicates(
@@ -147,6 +159,23 @@ def kraken_provider_asset_market(
             set_data(engine, ProviderAssetMarket.__tablename__, batch, "upsert")
         context.log.info(
             f"Upserted {len(data)} rows into {ProviderAssetMarket.__tablename__}"
+        )
+
+        return MaterializeResult(
+            metadata={
+                "row_count": len(data),
+                "pair_count": len(pairs),
+                "skipped_pairs": MetadataValue.json(skipped_pairs),
+                "table": ProviderAssetMarket.__tablename__,
+                "as_of": MetadataValue.text(as_of.isoformat()),
+                "min_timestamp": MetadataValue.text(
+                    data["timestamp"].min().isoformat()
+                ),
+                "max_timestamp": MetadataValue.text(
+                    data["timestamp"].max().isoformat()
+                ),
+                "preview": MetadataValue.md(data.head().to_markdown(index=False)),
+            }
         )
     finally:
         engine.dispose()
