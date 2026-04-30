@@ -135,7 +135,9 @@ def kraken_base_data(postgres_engine: Engine) -> dict[str, Any]:
         btc = Asset(name="BTC", description="BTC", asset_type_id=crypto_type.id)
         eth = Asset(name="ETH", description="ETH", asset_type_id=crypto_type.id)
         usd = Asset(name="USD", description="USD", asset_type_id=fiat_type.id)
-        one_inch = Asset(name="1INCH", description="1INCH", asset_type_id=crypto_type.id)
+        one_inch = Asset(
+            name="1INCH", description="1INCH", asset_type_id=crypto_type.id
+        )
         session.add_all([btc, eth, usd, one_inch])
         session.commit()
 

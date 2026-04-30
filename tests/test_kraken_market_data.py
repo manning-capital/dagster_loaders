@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 import responses
-from dagster import materialize
+from dagster import AssetSelection, materialize
 from mc_postgres_db.models import ProviderAssetMarket
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from dagster_loaders.defs import kraken_market_data
 from dagster_loaders.defs.kraken_market_data import (
     PostgresResource,
+    kraken_market_data_quality,
     kraken_provider_asset_market,
 )
 
@@ -204,3 +205,128 @@ def test_batches_large_dataset(
     with Session(postgres_engine) as session:
         rows = session.execute(select(ProviderAssetMarket)).scalars().all()
         assert len(rows) == n_per_pair * 2
+
+
+def _run_check_only(engine: Engine):
+    return materialize(
+        [kraken_provider_asset_market, kraken_market_data_quality],
+        selection=AssetSelection.checks(kraken_market_data_quality),
+        resources={
+            "postgres": PostgresResource(
+                url=engine.url.render_as_string(hide_password=False)
+            )
+        },
+    )
+
+
+def _seed_market_rows(
+    engine: Engine,
+    ids: dict[str, Any],
+    timestamps: list[dt.datetime],
+    close: float = 100.0,
+) -> None:
+    with Session(engine) as session:
+        session.add_all(
+            [
+                ProviderAssetMarket(
+                    timestamp=ts,
+                    provider_id=ids["provider_id"],
+                    from_asset_id=ids["usd_asset_id"],
+                    to_asset_id=ids["btc_asset_id"],
+                    open=close,
+                    high=close,
+                    low=close,
+                    close=close,
+                    volume=1.0,
+                )
+                for ts in timestamps
+            ]
+        )
+        session.commit()
+
+
+@responses.activate
+def test_data_quality_check_passes_after_materialize(
+    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+) -> None:
+    # Whole-minute timestamp: round down to the minute.
+    now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+    ts = int(now.timestamp())
+    _stub_kraken(
+        asset_pairs={"XXBTZUSD": {"base": "XXBT", "quote": "ZUSD"}},
+        market_data={
+            "XXBTZUSD": [[ts, "100", "100", "100", "100", "100", "100", 1]],
+        },
+    )
+    assert _materialize(postgres_engine).success
+
+    result = _run_check_only(postgres_engine)
+    assert result.success
+    evals = result.get_asset_check_evaluations()
+    assert len(evals) == 1
+    assert evals[0].passed is True
+    assert evals[0].metadata["rows_in_last_2h"].value == 1
+    assert evals[0].metadata["off_minute_rows"].value == 0
+    assert evals[0].metadata["gappy_pairs_count"].value == 0
+    assert evals[0].metadata["min_close_price"].value == 100.0
+
+
+def test_data_quality_check_fails_when_table_empty(
+    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+) -> None:
+    result = _run_check_only(postgres_engine)
+    assert result.success
+    evals = result.get_asset_check_evaluations()
+    assert len(evals) == 1
+    assert evals[0].passed is False
+    assert "no rows" in (evals[0].description or "")
+
+
+def test_data_quality_check_fails_on_off_minute_row(
+    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+) -> None:
+    base = dt.datetime.now(dt.timezone.utc).replace(
+        second=0, microsecond=0, tzinfo=None
+    )
+    _seed_market_rows(
+        postgres_engine,
+        kraken_base_data,
+        [
+            base,
+            base + dt.timedelta(seconds=37),  # off-minute
+            base + dt.timedelta(minutes=2),
+        ],
+    )
+
+    result = _run_check_only(postgres_engine)
+    evals = result.get_asset_check_evaluations()
+    assert evals[0].passed is False
+    assert evals[0].metadata["off_minute_rows"].value == 1
+    assert "whole-minute" in (evals[0].description or "")
+
+
+def test_data_quality_check_fails_on_gap(
+    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+) -> None:
+    base = dt.datetime.now(dt.timezone.utc).replace(
+        second=0, microsecond=0, tzinfo=None
+    )
+    # minutes 0, 1, 3 — minute 2 missing
+    _seed_market_rows(
+        postgres_engine,
+        kraken_base_data,
+        [
+            base,
+            base + dt.timedelta(minutes=1),
+            base + dt.timedelta(minutes=3),
+        ],
+    )
+
+    result = _run_check_only(postgres_engine)
+    evals = result.get_asset_check_evaluations()
+    assert evals[0].passed is False
+    assert evals[0].metadata["gappy_pairs_count"].value == 1
+    gappy = evals[0].metadata["gappy_pairs"].value
+    assert gappy[0]["actual"] == 3
+    assert gappy[0]["expected"] == 4
+    assert gappy[0]["missing"] == 1
