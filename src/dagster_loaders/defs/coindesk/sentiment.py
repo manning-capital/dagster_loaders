@@ -194,10 +194,7 @@ def coindesk_content_sentiment_quality(
                 .select_from(ProviderContent)
                 .outerjoin(
                     ProviderContentSentiment,
-                    (
-                        ProviderContent.id
-                        == ProviderContentSentiment.provider_content_id
-                    )
+                    (ProviderContent.id == ProviderContentSentiment.provider_content_id)
                     & (ProviderContentSentiment.sentiment_type_id == sentiment_type_id),
                 )
                 .where(
@@ -234,13 +231,9 @@ def coindesk_content_sentiment_quality(
     if out_of_range_compound:
         failures.append(f"{out_of_range_compound} compound scores outside [-1, 1]")
     if out_of_range_components:
-        failures.append(
-            f"{out_of_range_components} component scores outside [0, 1]"
-        )
+        failures.append(f"{out_of_range_components} component scores outside [0, 1]")
     if sum_off:
-        failures.append(
-            f"{sum_off} rows where pos+neg+neu deviates from 1.0 by >0.01"
-        )
+        failures.append(f"{sum_off} rows where pos+neg+neu deviates from 1.0 by >0.01")
     if uncovered:
         failures.append(
             f"{uncovered} NEWS rows from today without a NLTKVader sentiment"

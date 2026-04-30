@@ -31,6 +31,19 @@ from dagster_loaders.resources import PostgresResource
 from dagster_loaders.utils import compare_dataframes
 
 
+_CONTENT_TEXT_COLS = ("content_external_code", "authors", "title", "content")
+
+
+def _coerce_content_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    for col in _CONTENT_TEXT_COLS:
+        df[col] = df[col].astype(object)
+    df["id"] = df["id"].astype("Int64")
+    df["timestamp"] = pd.to_datetime(df["timestamp"]).astype("datetime64[ns]")
+    df["provider_id"] = df["provider_id"].astype("Int64")
+    df["content_type_id"] = df["content_type_id"].astype("Int64")
+    return df[CONTENT_COLUMNS]
+
+
 @asset(
     deps=[coindesk_news_providers],
     pool=COINDESK_API_POOL,
@@ -54,9 +67,7 @@ def coindesk_news_content(
     try:
         with Session(engine) as session:
             coindesk_provider_id = session.execute(
-                select(Provider.id).where(
-                    Provider.provider_external_code == "COINDESK"
-                )
+                select(Provider.id).where(Provider.provider_external_code == "COINDESK")
             ).scalar_one()
             news_content_type_id = session.execute(
                 select(ContentType.id).where(ContentType.name == "NEWS")
@@ -139,34 +150,14 @@ def coindesk_news_content(
             engine,
         )
 
-        existing["id"] = existing["id"].astype("Int64")
-        existing["timestamp"] = pd.to_datetime(existing["timestamp"]).astype(
-            "datetime64[ns]"
-        )
-        existing["provider_id"] = existing["provider_id"].astype("Int64")
-        existing["content_external_code"] = existing["content_external_code"].astype(
-            str
-        )
-        existing["content_type_id"] = existing["content_type_id"].astype("Int64")
-        existing["authors"] = existing["authors"].astype(str)
-        existing["title"] = existing["title"].astype(str)
-        existing["content"] = existing["content"].astype(str)
-        existing = existing[CONTENT_COLUMNS]
+        existing = _coerce_content_dtypes(existing)
 
         new = new.merge(
             existing[["id", "content_external_code"]].drop_duplicates(),
             on="content_external_code",
             how="left",
         )
-        new["id"] = new["id"].astype("Int64")
-        new["timestamp"] = pd.to_datetime(new["timestamp"]).astype("datetime64[ns]")
-        new["provider_id"] = new["provider_id"].astype("Int64")
-        new["content_external_code"] = new["content_external_code"].astype(str)
-        new["content_type_id"] = new["content_type_id"].astype("Int64")
-        new["authors"] = new["authors"].astype(str)
-        new["title"] = new["title"].astype(str)
-        new["content"] = new["content"].astype(str)
-        new = new[CONTENT_COLUMNS]
+        new = _coerce_content_dtypes(new)
 
         _, added, _, different = compare_dataframes(
             existing, new, ["content_external_code"]
@@ -193,12 +184,8 @@ def coindesk_news_content(
                 "added": len(added),
                 "updated": len(different),
                 "dropped_unmapped": dropped_unmapped,
-                "min_timestamp": MetadataValue.text(
-                    new["timestamp"].min().isoformat()
-                ),
-                "max_timestamp": MetadataValue.text(
-                    new["timestamp"].max().isoformat()
-                ),
+                "min_timestamp": MetadataValue.text(new["timestamp"].min().isoformat()),
+                "max_timestamp": MetadataValue.text(new["timestamp"].max().isoformat()),
                 "table": ProviderContent.__tablename__,
                 "preview": MetadataValue.md(
                     new[["timestamp", "provider_id", "title"]]

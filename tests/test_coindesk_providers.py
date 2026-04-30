@@ -237,14 +237,14 @@ def test_quality_check_fails_when_no_providers(
     assert "0 Coindesk news providers" in (evals[0].description or "")
 
 
-def test_quality_check_fails_on_null_name(
+def test_quality_check_fails_on_empty_name(
     postgres_engine: Engine, coindesk_base_data: dict[str, int]
 ) -> None:
     with Session(postgres_engine) as session:
         session.add(
             Provider(
                 provider_external_code="600",
-                name=None,
+                name="",
                 url="https://nameless.example",
                 is_active=True,
                 provider_type_id=coindesk_base_data["news_provider_type_id"],

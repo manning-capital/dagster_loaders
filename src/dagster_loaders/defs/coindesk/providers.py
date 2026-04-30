@@ -26,6 +26,19 @@ from dagster_loaders.resources import PostgresResource
 from dagster_loaders.utils import compare_dataframes
 
 
+_PROVIDER_TEXT_COLS = ("provider_external_code", "name", "url", "image_url")
+
+
+def _coerce_provider_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    for col in _PROVIDER_TEXT_COLS:
+        df[col] = df[col].astype(object)
+    df["id"] = df["id"].astype("Int64")
+    df["is_active"] = df["is_active"].astype("bool")
+    df["provider_type_id"] = df["provider_type_id"].astype("Int64")
+    df["underlying_provider_id"] = df["underlying_provider_id"].astype("Int64")
+    return df[PROVIDER_COLUMNS]
+
+
 @asset(
     pool=COINDESK_API_POOL,
     group_name="content",
@@ -48,9 +61,7 @@ def coindesk_news_providers(
     try:
         with Session(engine) as session:
             coindesk_provider_id = session.execute(
-                select(Provider.id).where(
-                    Provider.provider_external_code == "COINDESK"
-                )
+                select(Provider.id).where(Provider.provider_external_code == "COINDESK")
             ).scalar_one()
             news_provider_type_id = session.execute(
                 select(ProviderType.id).where(ProviderType.name == "NEWS_PROVIDER")
@@ -72,16 +83,7 @@ def coindesk_news_providers(
             ),
             engine,
         )
-        existing["id"] = existing["id"].astype("Int64")
-        existing["provider_external_code"] = existing["provider_external_code"].astype(
-            str
-        )
-        existing["is_active"] = existing["is_active"].astype("bool")
-        existing["provider_type_id"] = existing["provider_type_id"].astype("Int64")
-        existing["underlying_provider_id"] = existing["underlying_provider_id"].astype(
-            "Int64"
-        )
-        existing = existing[PROVIDER_COLUMNS]
+        existing = _coerce_provider_dtypes(existing)
 
         resp = requests.get(
             f"{COINDESK_API_HOST}/news/v1/source/list",
@@ -108,11 +110,7 @@ def coindesk_news_providers(
             on="provider_external_code",
             how="left",
         )
-        new["id"] = new["id"].astype("Int64")
-        new["is_active"] = new["is_active"].astype("bool")
-        new["provider_type_id"] = new["provider_type_id"].astype("Int64")
-        new["underlying_provider_id"] = new["underlying_provider_id"].astype("Int64")
-        new = new[PROVIDER_COLUMNS]
+        new = _coerce_provider_dtypes(new)
 
         _, added, _, different = compare_dataframes(
             existing, new, ["provider_external_code"]
@@ -163,9 +161,7 @@ def coindesk_news_providers_quality(postgres: PostgresResource) -> AssetCheckRes
     try:
         with Session(engine) as session:
             coindesk_provider_id = session.execute(
-                select(Provider.id).where(
-                    Provider.provider_external_code == "COINDESK"
-                )
+                select(Provider.id).where(Provider.provider_external_code == "COINDESK")
             ).scalar_one()
             news_provider_type_id = session.execute(
                 select(ProviderType.id).where(ProviderType.name == "NEWS_PROVIDER")
