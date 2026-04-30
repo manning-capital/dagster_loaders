@@ -35,7 +35,9 @@ class PostgresResource(ConfigurableResource):
         return create_engine(self.url)
 
 
-def _request_kraken(url: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+def _request_kraken(
+    url: str, params: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
     resp = requests.get(url, params=params, timeout=30)
     resp.raise_for_status()
     body = resp.json()
@@ -96,6 +98,7 @@ def kraken_provider_asset_market(
 
         time.sleep(KRAKEN_RATE_LIMIT_SECONDS)
         pairs_body = _request_kraken(ASSET_PAIRS_URL)
+        all_pairs_count = len(pairs_body["result"])
         pairs = [
             (code, info["quote"], info["base"])
             for code, info in pairs_body["result"].items()
@@ -103,11 +106,19 @@ def kraken_provider_asset_market(
             and info["quote"] in asset_map
             and info["base"] in asset_map
         ]
-        context.log.info(f"Kraken pairs after filtering: {len(pairs)}")
+        context.log.info(
+            f"Kraken returned {all_pairs_count} pairs; "
+            f"{len(pairs)} match venue + asset map filters: "
+            f"{[code for code, _, _ in pairs]}"
+        )
 
         frames: list[pd.DataFrame] = []
-        for code, from_code, to_code in pairs:
+        total = len(pairs)
+        for idx, (code, from_code, to_code) in enumerate(pairs, start=1):
             try:
+                context.log.info(
+                    f"[{idx}/{total}] Requesting OHLC for {code} ({from_code} -> {to_code})"
+                )
                 time.sleep(KRAKEN_RATE_LIMIT_SECONDS)
                 ohlc_body = _request_kraken(OHLC_URL, params={"pair": code})
                 rows = ohlc_body["result"][code]
@@ -132,8 +143,9 @@ def kraken_provider_asset_market(
                 df["to_asset_id"] = asset_map[to_code]
                 df["provider_id"] = provider_id
                 frames.append(df)
+                context.log.info(f"[{idx}/{total}] Fetched {len(df)} rows for {code}")
             except Exception as e:
-                context.log.error(f"Skipping pair {code}: {e}")
+                context.log.error(f"[{idx}/{total}] Skipping pair {code}: {e}")
                 skipped_pairs.append(code)
 
         if not frames:
