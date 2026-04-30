@@ -195,6 +195,49 @@ def test_drops_articles_with_null_or_empty_body(
 
 
 @responses.activate
+def test_legacy_empty_content_row_gets_filled_when_api_returns_body(
+    postgres_engine: Engine, coindesk_base_data: dict[str, int]
+) -> None:
+    """A row with empty content already in the DB (e.g. from before the filter
+    was deployed) should be updated to a non-empty body the next time the API
+    returns that article with a filled BODY."""
+    source_id = _seed_news_provider(
+        postgres_engine, coindesk_base_data, external_code="42"
+    )
+    with Session(postgres_engine) as session:
+        session.add(
+            ProviderContent(
+                timestamp=dt.datetime.now() - dt.timedelta(hours=3),
+                provider_id=source_id,
+                content_external_code="7001",
+                content_type_id=coindesk_base_data["news_content_type_id"],
+                authors="Editorial",
+                title="OldTitle",
+                content="",
+            )
+        )
+        session.commit()
+
+    _stub_articles(
+        [
+            _article(
+                id=7001,
+                source_id=42,
+                title="NewTitle",
+                body="now there is content",
+            )
+        ]
+    )
+    assert _materialize(postgres_engine).success
+
+    with Session(postgres_engine) as session:
+        rows = session.execute(select(ProviderContent)).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].content == "now there is content"
+        assert rows[0].title == "NewTitle"
+
+
+@responses.activate
 def test_empty_api_response_is_no_op(
     postgres_engine: Engine, coindesk_base_data: dict[str, int]
 ) -> None:

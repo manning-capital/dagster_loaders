@@ -124,9 +124,7 @@ def coindesk_news_content(
             )
         new = new[~unmapped_mask].copy()
 
-        empty_content_mask = (
-            new["content"].fillna("").astype(str).str.strip() == ""
-        )
+        empty_content_mask = new["content"].fillna("").astype(str).str.strip() == ""
         dropped_empty_content = int(empty_content_mask.sum())
         if dropped_empty_content:
             context.log.warning(
