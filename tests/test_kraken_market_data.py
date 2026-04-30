@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from dagster_loaders.defs import kraken_market_data
 from dagster_loaders.defs.kraken_market_data import (
     PostgresResource,
+    kraken_market_data_quality,
     kraken_provider_asset_market,
 )
 
@@ -204,3 +205,53 @@ def test_batches_large_dataset(
     with Session(postgres_engine) as session:
         rows = session.execute(select(ProviderAssetMarket)).scalars().all()
         assert len(rows) == n_per_pair * 2
+
+
+@responses.activate
+def test_data_quality_check_passes_after_materialize(
+    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+) -> None:
+    ts = int(dt.datetime.utcnow().timestamp())
+    _stub_kraken(
+        asset_pairs={"XXBTZUSD": {"base": "XXBT", "quote": "ZUSD"}},
+        market_data={
+            "XXBTZUSD": [[ts, "100", "100", "100", "100", "100", "100", 1]],
+        },
+    )
+    assert _materialize(postgres_engine).success
+
+    result = materialize(
+        [kraken_provider_asset_market, kraken_market_data_quality],
+        selection=[kraken_market_data_quality],
+        resources={
+            "postgres": PostgresResource(
+                url=postgres_engine.url.render_as_string(hide_password=False)
+            )
+        },
+    )
+    assert result.success
+    check_evals = result.get_asset_check_evaluations()
+    assert len(check_evals) == 1
+    eval_ = check_evals[0]
+    assert eval_.passed is True
+    assert eval_.metadata["rows_in_last_2h"].value == 1
+    assert eval_.metadata["null_pk_rows"].value == 0
+    assert eval_.metadata["min_close_price"].value == 100.0
+
+
+def test_data_quality_check_fails_when_table_empty(
+    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+) -> None:
+    result = materialize(
+        [kraken_provider_asset_market, kraken_market_data_quality],
+        selection=[kraken_market_data_quality],
+        resources={
+            "postgres": PostgresResource(
+                url=postgres_engine.url.render_as_string(hide_password=False)
+            )
+        },
+    )
+    assert result.success
+    eval_ = result.get_asset_check_evaluations()[0]
+    assert eval_.passed is False
+    assert "no rows" in (eval_.description or "")
