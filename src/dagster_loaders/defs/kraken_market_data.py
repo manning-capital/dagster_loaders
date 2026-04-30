@@ -23,7 +23,7 @@ from dagster import (
 )
 from mc_postgres_db.models import Asset, Provider, ProviderAsset, ProviderAssetMarket
 from mc_postgres_db.operations import set_data
-from sqlalchemy import Engine, create_engine, func, or_, select
+from sqlalchemy import Engine, create_engine, func, select
 from sqlalchemy.orm import Session
 
 
@@ -218,8 +218,9 @@ def kraken_provider_asset_market(
     asset=kraken_provider_asset_market,
     name="kraken_market_data_quality",
     description=(
-        "Sanity checks on the data freshly upserted by the Kraken asset: "
-        "rows present in the last 2h, no null PK columns, all close prices > 0."
+        "Within the recent 2h window: rows present, all close prices > 0, "
+        "every timestamp on a whole-minute boundary, and per-pair points "
+        "uniformly spaced inside [min, max] (edges ignored)."
     ),
     blocking=False,
 )
@@ -230,42 +231,77 @@ def kraken_market_data_quality(postgres: PostgresResource) -> AssetCheckResult:
             recent_cutoff = dt.datetime.now(dt.timezone.utc).replace(
                 tzinfo=None
             ) - dt.timedelta(hours=2)
+
             recent_rows = session.execute(
                 select(func.count())
                 .select_from(ProviderAssetMarket)
                 .where(ProviderAssetMarket.timestamp >= recent_cutoff)
             ).scalar_one()
 
-            max_ts = session.execute(
-                select(func.max(ProviderAssetMarket.timestamp))
-            ).scalar_one()
-
             min_close = session.execute(
-                select(func.min(ProviderAssetMarket.close))
+                select(func.min(ProviderAssetMarket.close)).where(
+                    ProviderAssetMarket.timestamp >= recent_cutoff
+                )
             ).scalar_one()
 
-            null_pk_rows = session.execute(
+            off_minute_rows = session.execute(
                 select(func.count())
                 .select_from(ProviderAssetMarket)
                 .where(
-                    or_(
-                        ProviderAssetMarket.timestamp.is_(None),
-                        ProviderAssetMarket.from_asset_id.is_(None),
-                        ProviderAssetMarket.to_asset_id.is_(None),
-                        ProviderAssetMarket.provider_id.is_(None),
-                    )
+                    ProviderAssetMarket.timestamp >= recent_cutoff,
+                    func.extract("second", ProviderAssetMarket.timestamp) != 0,
                 )
             ).scalar_one()
+
+            pair_stats = session.execute(
+                select(
+                    ProviderAssetMarket.from_asset_id,
+                    ProviderAssetMarket.to_asset_id,
+                    ProviderAssetMarket.provider_id,
+                    func.min(ProviderAssetMarket.timestamp).label("min_ts"),
+                    func.max(ProviderAssetMarket.timestamp).label("max_ts"),
+                    func.count().label("actual"),
+                )
+                .where(ProviderAssetMarket.timestamp >= recent_cutoff)
+                .group_by(
+                    ProviderAssetMarket.from_asset_id,
+                    ProviderAssetMarket.to_asset_id,
+                    ProviderAssetMarket.provider_id,
+                )
+            ).all()
     finally:
         engine.dispose()
+
+    gappy_pairs: list[dict[str, Any]] = []
+    for row in pair_stats:
+        if row.actual <= 1:
+            continue
+        expected = int((row.max_ts - row.min_ts).total_seconds() // 60) + 1
+        if row.actual < expected:
+            gappy_pairs.append(
+                {
+                    "from_asset_id": row.from_asset_id,
+                    "to_asset_id": row.to_asset_id,
+                    "provider_id": row.provider_id,
+                    "actual": row.actual,
+                    "expected": expected,
+                    "missing": expected - row.actual,
+                }
+            )
 
     failures: list[str] = []
     if recent_rows == 0:
         failures.append("no rows with timestamp in the last 2h")
     if min_close is not None and min_close <= 0:
         failures.append(f"min(close) = {min_close} (expected > 0)")
-    if null_pk_rows > 0:
-        failures.append(f"{null_pk_rows} rows have NULL PK columns")
+    if off_minute_rows > 0:
+        failures.append(
+            f"{off_minute_rows} rows are not aligned to a whole-minute boundary"
+        )
+    if gappy_pairs:
+        failures.append(
+            f"{len(gappy_pairs)} pair(s) have minute gaps inside the recent window"
+        )
 
     return AssetCheckResult(
         passed=not failures,
@@ -273,9 +309,10 @@ def kraken_market_data_quality(postgres: PostgresResource) -> AssetCheckResult:
         description="; ".join(failures) if failures else "ok",
         metadata={
             "rows_in_last_2h": recent_rows,
-            "max_timestamp": MetadataValue.text(str(max_ts)),
             "min_close_price": MetadataValue.float(float(min_close or 0.0)),
-            "null_pk_rows": null_pk_rows,
+            "off_minute_rows": off_minute_rows,
+            "gappy_pairs_count": len(gappy_pairs),
+            "gappy_pairs": MetadataValue.json(gappy_pairs),
         },
     )
 
