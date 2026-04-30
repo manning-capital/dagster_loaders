@@ -227,7 +227,9 @@ def kraken_market_data_quality(postgres: PostgresResource) -> AssetCheckResult:
     engine = postgres.get_engine()
     try:
         with Session(engine) as session:
-            recent_cutoff = dt.datetime.utcnow() - dt.timedelta(hours=2)
+            recent_cutoff = dt.datetime.now(dt.timezone.utc).replace(
+                tzinfo=None
+            ) - dt.timedelta(hours=2)
             recent_rows = session.execute(
                 select(func.count())
                 .select_from(ProviderAssetMarket)

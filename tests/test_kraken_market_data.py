@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 import responses
-from dagster import materialize
+from dagster import AssetSelection, materialize
 from mc_postgres_db.models import ProviderAssetMarket
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
@@ -207,11 +207,23 @@ def test_batches_large_dataset(
         assert len(rows) == n_per_pair * 2
 
 
+def _run_check_only(engine: Engine):
+    return materialize(
+        [kraken_provider_asset_market, kraken_market_data_quality],
+        selection=AssetSelection.checks(kraken_market_data_quality),
+        resources={
+            "postgres": PostgresResource(
+                url=engine.url.render_as_string(hide_password=False)
+            )
+        },
+    )
+
+
 @responses.activate
 def test_data_quality_check_passes_after_materialize(
     postgres_engine: Engine, kraken_base_data: dict[str, Any]
 ) -> None:
-    ts = int(dt.datetime.utcnow().timestamp())
+    ts = int(dt.datetime.now(dt.timezone.utc).timestamp())
     _stub_kraken(
         asset_pairs={"XXBTZUSD": {"base": "XXBT", "quote": "ZUSD"}},
         market_data={
@@ -220,38 +232,22 @@ def test_data_quality_check_passes_after_materialize(
     )
     assert _materialize(postgres_engine).success
 
-    result = materialize(
-        [kraken_provider_asset_market, kraken_market_data_quality],
-        selection=[kraken_market_data_quality],
-        resources={
-            "postgres": PostgresResource(
-                url=postgres_engine.url.render_as_string(hide_password=False)
-            )
-        },
-    )
+    result = _run_check_only(postgres_engine)
     assert result.success
-    check_evals = result.get_asset_check_evaluations()
-    assert len(check_evals) == 1
-    eval_ = check_evals[0]
-    assert eval_.passed is True
-    assert eval_.metadata["rows_in_last_2h"].value == 1
-    assert eval_.metadata["null_pk_rows"].value == 0
-    assert eval_.metadata["min_close_price"].value == 100.0
+    evals = result.get_asset_check_evaluations()
+    assert len(evals) == 1
+    assert evals[0].passed is True
+    assert evals[0].metadata["rows_in_last_2h"].value == 1
+    assert evals[0].metadata["null_pk_rows"].value == 0
+    assert evals[0].metadata["min_close_price"].value == 100.0
 
 
 def test_data_quality_check_fails_when_table_empty(
     postgres_engine: Engine, kraken_base_data: dict[str, Any]
 ) -> None:
-    result = materialize(
-        [kraken_provider_asset_market, kraken_market_data_quality],
-        selection=[kraken_market_data_quality],
-        resources={
-            "postgres": PostgresResource(
-                url=postgres_engine.url.render_as_string(hide_password=False)
-            )
-        },
-    )
+    result = _run_check_only(postgres_engine)
     assert result.success
-    eval_ = result.get_asset_check_evaluations()[0]
-    assert eval_.passed is False
-    assert "no rows" in (eval_.description or "")
+    evals = result.get_asset_check_evaluations()
+    assert len(evals) == 1
+    assert evals[0].passed is False
+    assert "no rows" in (evals[0].description or "")
