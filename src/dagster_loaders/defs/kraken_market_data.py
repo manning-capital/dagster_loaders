@@ -9,9 +9,7 @@ from dagster import (
     AssetCheckSeverity,
     AssetExecutionContext,
     Backoff,
-    ConfigurableResource,
     Definitions,
-    EnvVar,
     FreshnessPolicy,
     MaterializeResult,
     MetadataValue,
@@ -23,8 +21,10 @@ from dagster import (
 )
 from mc_postgres_db.models import Asset, Provider, ProviderAsset, ProviderAssetMarket
 from mc_postgres_db.operations import set_data
-from sqlalchemy import Engine, create_engine, func, select
+from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
+
+from dagster_loaders.resources import PostgresResource
 
 
 KRAKEN_POOL = "kraken-api"
@@ -32,13 +32,6 @@ KRAKEN_RATE_LIMIT_SECONDS = 1.0
 BATCH_SIZE = 5000
 ASSET_PAIRS_URL = "https://api.kraken.com/0/public/AssetPairs"
 OHLC_URL = "https://api.kraken.com/0/public/OHLC"
-
-
-class PostgresResource(ConfigurableResource):
-    url: str
-
-    def get_engine(self) -> Engine:
-        return create_engine(self.url)
 
 
 def _request_kraken(
@@ -334,5 +327,4 @@ defs = Definitions(
     asset_checks=[kraken_market_data_quality],
     jobs=[kraken_market_job],
     schedules=[kraken_market_schedule],
-    resources={"postgres": PostgresResource(url=EnvVar("POSTGRES_URL"))},
 )

@@ -6,6 +6,7 @@ dependencies = [
     "dagster>=1.13.2",
     "dagster-cloud>=1.13.2",
     "mc-postgres-db==1.3.1",
+    "nltk>=3.9.0",
     "pandas>=2.2.3",
     "psycopg2-binary>=2.9.10",
     "requests>=2.32.3",
