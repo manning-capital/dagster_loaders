@@ -124,6 +124,16 @@ def coindesk_news_content(
             )
         new = new[~unmapped_mask].copy()
 
+        empty_content_mask = (
+            new["content"].fillna("").astype(str).str.strip() == ""
+        )
+        dropped_empty_content = int(empty_content_mask.sum())
+        if dropped_empty_content:
+            context.log.warning(
+                f"Dropping {dropped_empty_content} articles with null/empty BODY"
+            )
+        new = new[~empty_content_mask].copy()
+
         if new.empty:
             return MaterializeResult(
                 metadata={
@@ -131,6 +141,7 @@ def coindesk_news_content(
                     "added": 0,
                     "updated": 0,
                     "dropped_unmapped": dropped_unmapped,
+                    "dropped_empty_content": dropped_empty_content,
                     "table": ProviderContent.__tablename__,
                 }
             )
@@ -175,7 +186,7 @@ def coindesk_news_content(
 
         context.log.info(
             f"content: {len(added)} added, {len(different)} updated, "
-            f"{dropped_unmapped} unmapped"
+            f"{dropped_unmapped} unmapped, {dropped_empty_content} empty-body"
         )
 
         return MaterializeResult(
@@ -184,6 +195,7 @@ def coindesk_news_content(
                 "added": len(added),
                 "updated": len(different),
                 "dropped_unmapped": dropped_unmapped,
+                "dropped_empty_content": dropped_empty_content,
                 "min_timestamp": MetadataValue.text(new["timestamp"].min().isoformat()),
                 "max_timestamp": MetadataValue.text(new["timestamp"].max().isoformat()),
                 "table": ProviderContent.__tablename__,

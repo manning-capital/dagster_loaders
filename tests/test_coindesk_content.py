@@ -172,6 +172,29 @@ def test_updates_existing_content_when_title_changes(
 
 
 @responses.activate
+def test_drops_articles_with_null_or_empty_body(
+    postgres_engine: Engine, coindesk_base_data: dict[str, int]
+) -> None:
+    _seed_news_provider(postgres_engine, coindesk_base_data, external_code="42")
+    _stub_articles(
+        [
+            _article(id=6001, source_id=42, title="Has body", body="real content"),
+            _article(id=6002, source_id=42, title="None body", body=None),  # type: ignore[arg-type]
+            _article(id=6003, source_id=42, title="Empty body", body=""),
+            _article(id=6004, source_id=42, title="Whitespace body", body="   \n  "),
+        ]
+    )
+
+    result = _materialize(postgres_engine)
+    assert result.success
+
+    with Session(postgres_engine) as session:
+        rows = session.execute(select(ProviderContent)).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].content_external_code == "6001"
+
+
+@responses.activate
 def test_empty_api_response_is_no_op(
     postgres_engine: Engine, coindesk_base_data: dict[str, int]
 ) -> None:
