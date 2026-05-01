@@ -8,9 +8,9 @@ on:
     types: [opened, synchronize, reopened, closed]
 
 concurrency:
-  # Cancel in-progress deploys to same branch
+  # Cancel in-progress deploys for PR builds, but queue main deploys so every merge gets deployed
   group: ${{ github.ref }}/deploy
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
   # The organization name in Dagster Cloud
   DAGSTER_CLOUD_ORGANIZATION: "manning-capital"
