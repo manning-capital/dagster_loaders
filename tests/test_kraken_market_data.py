@@ -267,7 +267,7 @@ def test_data_quality_check_passes_after_materialize(
     assert evals[0].passed is True
     assert evals[0].metadata["rows_in_last_2h"].value == 1
     assert evals[0].metadata["off_minute_rows"].value == 0
-    assert evals[0].metadata["gappy_pairs_count"].value == 0
+    assert evals[0].metadata["low_density_pairs_count"].value == 0
     assert evals[0].metadata["min_close_price"].value == 100.0
 
 
