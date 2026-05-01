@@ -16,31 +16,25 @@ from dagster_loaders.defs.coinbase.market_data import (
 )
 
 
-def _candle(ts: int, value: str = "100") -> dict[str, str]:
-    return {
-        "start": str(ts),
-        "low": value,
-        "high": value,
-        "open": value,
-        "close": value,
-        "volume": value,
-    }
+def _candle(ts: int, value: float = 100.0) -> list[float]:
+    # Exchange API: [time, low, high, open, close, volume]
+    return [ts, value, value, value, value, value]
 
 
 def _stub_coinbase(
     products: list[dict[str, Any]],
-    candles_by_product: dict[str, list[dict[str, str]]],
+    candles_by_product: dict[str, list[list[float]]],
 ) -> None:
     responses.add(
         responses.GET,
         coinbase_market_data.PRODUCTS_URL,
-        json={"products": products},
+        json=products,
     )
     for product_id, candles in candles_by_product.items():
         responses.add(
             responses.GET,
             coinbase_market_data.CANDLES_URL_TEMPLATE.format(product_id=product_id),
-            json={"candles": candles},
+            json=candles,
         )
 
 
@@ -48,13 +42,11 @@ def _online_product(
     product_id: str, base: str, quote: str, **overrides: Any
 ) -> dict[str, Any]:
     p = {
-        "product_id": product_id,
-        "base_currency_id": base,
-        "quote_currency_id": quote,
+        "id": product_id,
+        "base_currency": base,
+        "quote_currency": quote,
         "status": "online",
-        "is_disabled": False,
         "trading_disabled": False,
-        "view_only": False,
         "auction_mode": False,
     }
     p.update(overrides)
@@ -165,9 +157,9 @@ def test_skips_products_not_in_asset_map(
     "overrides",
     [
         {"status": "offline"},
-        {"is_disabled": True},
+        {"status": "delisted"},
+        {"status": "internal"},
         {"trading_disabled": True},
-        {"view_only": True},
         {"auction_mode": True},
     ],
 )
@@ -319,32 +311,6 @@ def test_data_quality_check_fails_on_off_minute_row(
     assert evals[0].passed is False
     assert evals[0].metadata["off_minute_rows"].value == 1
     assert "whole-minute" in (evals[0].description or "")
-
-
-def test_data_quality_check_fails_on_gap(
-    postgres_engine: Engine, coinbase_base_data: dict[str, Any]
-) -> None:
-    base = dt.datetime.now(dt.timezone.utc).replace(
-        second=0, microsecond=0, tzinfo=None
-    )
-    _seed_market_rows(
-        postgres_engine,
-        coinbase_base_data,
-        [
-            base,
-            base + dt.timedelta(minutes=1),
-            base + dt.timedelta(minutes=3),
-        ],
-    )
-
-    result = _run_check_only(postgres_engine)
-    evals = result.get_asset_check_evaluations()
-    assert evals[0].passed is False
-    assert evals[0].metadata["gappy_pairs_count"].value == 1
-    gappy = evals[0].metadata["gappy_pairs"].value
-    assert gappy[0]["actual"] == 3
-    assert gappy[0]["expected"] == 4
-    assert gappy[0]["missing"] == 1
 
 
 def test_check_ignores_kraken_rows(

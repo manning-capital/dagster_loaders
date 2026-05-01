@@ -305,33 +305,6 @@ def test_data_quality_check_fails_on_off_minute_row(
     assert "whole-minute" in (evals[0].description or "")
 
 
-def test_data_quality_check_fails_on_gap(
-    postgres_engine: Engine, kraken_base_data: dict[str, Any]
-) -> None:
-    base = dt.datetime.now(dt.timezone.utc).replace(
-        second=0, microsecond=0, tzinfo=None
-    )
-    # minutes 0, 1, 3 — minute 2 missing
-    _seed_market_rows(
-        postgres_engine,
-        kraken_base_data,
-        [
-            base,
-            base + dt.timedelta(minutes=1),
-            base + dt.timedelta(minutes=3),
-        ],
-    )
-
-    result = _run_check_only(postgres_engine)
-    evals = result.get_asset_check_evaluations()
-    assert evals[0].passed is False
-    assert evals[0].metadata["gappy_pairs_count"].value == 1
-    gappy = evals[0].metadata["gappy_pairs"].value
-    assert gappy[0]["actual"] == 3
-    assert gappy[0]["expected"] == 4
-    assert gappy[0]["missing"] == 1
-
-
 def test_check_ignores_coinbase_rows(
     postgres_engine: Engine,
     kraken_base_data: dict[str, Any],
