@@ -141,7 +141,7 @@ def test_fails_on_15_percent_spread(
     result = cross_provider_consistency_check(postgres_engine)
     assert result.passed is False
     assert result.metadata["failing_pairs_count"].value == 1
-    assert "exceeded 10% spread" in (result.description or "")
+    assert "exceeded 10%" in (result.description or "")
 
 
 def test_usdt_collapses_to_usd_via_underlying(
@@ -282,18 +282,18 @@ def test_window_cutoff_excludes_stale_rows(
     kraken_base_data: dict[str, Any],
 ) -> None:
     """Window is `[anchor - window_minutes, anchor]` where anchor =
-    floor(now, hour). Coinbase row sits just before the window start (excluded);
-    Kraken row is inside. Only one provider in window -> pair is skipped.
-
-    Tests against the configurable window param so the assertion stays valid
-    if the default is tuned later.
+    floor(now, hour). Coinbase row sits before the window start AND before the
+    ffill buffer (so it can't be forward-filled into the window either); Kraken
+    row is inside. Only one provider in window -> pair is skipped.
     """
     window_minutes = 30
+    ffill_buffer_minutes = 30
     anchor = _window_end()
     with Session(postgres_engine) as session:
         _seed_market_row(
             session,
-            timestamp=anchor - dt.timedelta(minutes=window_minutes + 1),
+            timestamp=anchor
+            - dt.timedelta(minutes=window_minutes + ffill_buffer_minutes + 1),
             provider_id=coinbase_base_data["provider_id"],
             from_asset_id=coinbase_base_data["usd_asset_id"],
             to_asset_id=coinbase_base_data["btc_asset_id"],
@@ -310,10 +310,55 @@ def test_window_cutoff_excludes_stale_rows(
         session.commit()
 
     result = cross_provider_consistency_check(
-        postgres_engine, window_minutes=window_minutes
+        postgres_engine,
+        window_minutes=window_minutes,
+        ffill_buffer_minutes=ffill_buffer_minutes,
     )
     assert result.metadata["pairs_evaluated"].value == 0
     assert result.metadata["pairs_skipped_single_provider"].value == 1
+
+
+def test_buffer_lets_prior_row_forward_fill_into_window(
+    postgres_engine: Engine,
+    coinbase_base_data: dict[str, Any],
+    kraken_base_data: dict[str, Any],
+) -> None:
+    """A row 5 min before window_start is fetched via the ffill buffer and
+    forward-fills across the entire window — so the pair can be evaluated even
+    if the provider has no row inside the comparison window itself.
+
+    This is the whole point of the buffer: a brief loader hiccup that misses
+    the in-window writes shouldn't kick that provider out.
+    """
+    anchor = _window_end()
+    with Session(postgres_engine) as session:
+        # Coinbase wrote 5 min before window_start and nothing since.
+        _seed_market_row(
+            session,
+            timestamp=anchor - dt.timedelta(minutes=65),
+            provider_id=coinbase_base_data["provider_id"],
+            from_asset_id=coinbase_base_data["usd_asset_id"],
+            to_asset_id=coinbase_base_data["btc_asset_id"],
+            close=78000.0,
+        )
+        # Kraken wrote a row at the anchor.
+        _seed_market_row(
+            session,
+            timestamp=anchor,
+            provider_id=kraken_base_data["provider_id"],
+            from_asset_id=kraken_base_data["usd_asset_id"],
+            to_asset_id=kraken_base_data["btc_asset_id"],
+            close=78000.0,
+        )
+        session.commit()
+
+    result = cross_provider_consistency_check(postgres_engine)
+    # Pair gets evaluated because Coinbase's pre-window row forward-fills
+    # across the entire window grid; Kraken contributes one minute (anchor).
+    # Both providers present at the anchor minute -> pair evaluated, passes.
+    assert result.passed is True
+    assert result.metadata["pairs_evaluated"].value == 1
+    assert result.metadata["pairs_skipped_single_provider"].value == 0
 
 
 def test_post_anchor_rows_excluded(
@@ -349,6 +394,60 @@ def test_post_anchor_rows_excluded(
     result = cross_provider_consistency_check(postgres_engine)
     assert result.passed is False
     assert "no rows in window" in (result.description or "")
+
+
+def test_median_dilutes_single_misaligned_minute(
+    postgres_engine: Engine,
+    coinbase_base_data: dict[str, Any],
+    kraken_base_data: dict[str, Any],
+) -> None:
+    """The whole reason we use median per-minute spread: a single misaligned
+    minute (where one provider's price is stale) shouldn't fail the check.
+
+    Setup: both providers track BTC at $78k for 60 minutes, but at the very
+    last minute Kraken's loader hadn't yet caught up to a real $90k spike on
+    Coinbase — so the latest-only comparison would see 14% (failing), but
+    median across the prior 59 quiet minutes is ~0%.
+    """
+    anchor = _window_end()
+    with Session(postgres_engine) as session:
+        # 60 minutes of identical $78k closes for both providers, ending one
+        # minute before the anchor.
+        for offset in range(1, 61):
+            _seed_market_row(
+                session,
+                timestamp=anchor - dt.timedelta(minutes=offset),
+                provider_id=coinbase_base_data["provider_id"],
+                from_asset_id=coinbase_base_data["usd_asset_id"],
+                to_asset_id=coinbase_base_data["btc_asset_id"],
+                close=78000.0,
+            )
+            _seed_market_row(
+                session,
+                timestamp=anchor - dt.timedelta(minutes=offset),
+                provider_id=kraken_base_data["provider_id"],
+                from_asset_id=kraken_base_data["usd_asset_id"],
+                to_asset_id=kraken_base_data["btc_asset_id"],
+                close=78000.0,
+            )
+        # Coinbase wrote a $90k row at the anchor; Kraken hasn't caught up.
+        # In the latest-only comparison this would be 14% spread; with median
+        # across the 60 minutes it's a single outlier diluted by 60 zeros.
+        _seed_market_row(
+            session,
+            timestamp=anchor,
+            provider_id=coinbase_base_data["provider_id"],
+            from_asset_id=coinbase_base_data["usd_asset_id"],
+            to_asset_id=coinbase_base_data["btc_asset_id"],
+            close=90000.0,
+        )
+        session.commit()
+
+    result = cross_provider_consistency_check(postgres_engine)
+    assert result.passed is True
+    # Many minutes evaluated; median across them is 0 (or near-0).
+    assert result.metadata["pairs_evaluated"].value == 1
+    assert result.metadata["max_pair_median_spread"].value < 0.01
 
 
 def test_empty_table_marks_check_as_failed(postgres_engine: Engine) -> None:
