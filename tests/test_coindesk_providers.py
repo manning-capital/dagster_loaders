@@ -2,17 +2,16 @@ from typing import Any
 
 import responses
 from dagster import AssetSelection, materialize
-from mc_postgres_db.models import Provider
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
+from mc_postgres_db.models import Provider
 
+from dagster_loaders.resources import PostgresResource
 from dagster_loaders.defs.coindesk.common import COINDESK_API_HOST
 from dagster_loaders.defs.coindesk.providers import (
     coindesk_news_providers,
     coindesk_news_providers_quality,
 )
-from dagster_loaders.resources import PostgresResource
-
 
 SOURCE_LIST_URL = f"{COINDESK_API_HOST}/news/v1/source/list"
 

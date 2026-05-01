@@ -1,33 +1,33 @@
-import datetime as dt
-import logging
 import os
-import socket
 import time
 import uuid
-from collections.abc import Generator
+import socket
+import logging
+import datetime as dt
 from typing import Any
+from collections.abc import Generator
 
 import docker
 import pytest
+from sqlalchemy import Engine, text, select, create_engine
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 from mc_postgres_db.models import (
-    Asset,
-    AssetType,
     Base,
-    ContentType,
+    Asset,
     Provider,
-    ProviderAsset,
+    AssetType,
+    ContentType,
     ProviderType,
+    ProviderAsset,
     SentimentType,
 )
 from mc_postgres_db.testing.utilities import (
     TEST_DB_NAME,
-    TEST_DB_PASSWORD,
     TEST_DB_USER,
+    TEST_DB_PASSWORD,
     clear_database,
 )
-from sqlalchemy import Engine, create_engine, select, text
-from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm import Session
 
 LOGGER = logging.getLogger(__name__)
 

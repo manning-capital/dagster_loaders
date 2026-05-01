@@ -1,30 +1,29 @@
 import pandas as pd
 import requests
 from dagster import (
+    Definitions,
+    MetadataValue,
     AssetCheckResult,
+    MaterializeResult,
     AssetCheckSeverity,
     AssetExecutionContext,
-    Definitions,
-    MaterializeResult,
-    MetadataValue,
     asset,
     asset_check,
 )
-from mc_postgres_db.models import Provider, ProviderType
-from mc_postgres_db.operations import set_data
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from mc_postgres_db.models import Provider, ProviderType
+from mc_postgres_db.operations import set_data
 
+from dagster_loaders.utils import compare_dataframes
+from dagster_loaders.resources import PostgresResource
 from dagster_loaders.defs.coindesk.common import (
-    COINDESK_API_HOST,
-    COINDESK_API_POOL,
+    RETRY,
     FRESHNESS,
     PROVIDER_COLUMNS,
-    RETRY,
+    COINDESK_API_HOST,
+    COINDESK_API_POOL,
 )
-from dagster_loaders.resources import PostgresResource
-from dagster_loaders.utils import compare_dataframes
-
 
 _PROVIDER_TEXT_COLS = ("provider_external_code", "name", "url", "image_url")
 

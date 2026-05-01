@@ -3,18 +3,17 @@ from typing import Any
 
 import responses
 from dagster import AssetSelection, materialize
-from mc_postgres_db.models import Provider, ProviderContent
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
+from mc_postgres_db.models import Provider, ProviderContent
 
+from dagster_loaders.resources import PostgresResource
 from dagster_loaders.defs.coindesk.common import COINDESK_API_HOST
 from dagster_loaders.defs.coindesk.content import (
     coindesk_news_content,
     coindesk_news_content_quality,
 )
 from dagster_loaders.defs.coindesk.providers import coindesk_news_providers
-from dagster_loaders.resources import PostgresResource
-
 
 ARTICLE_LIST_URL = f"{COINDESK_API_HOST}/news/v1/article/list"
 

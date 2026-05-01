@@ -20,7 +20,18 @@ dev = [
     "docker>=7.0.0",
     "pytest>=8.4.0",
     "responses>=0.25.0",
+    "ruff>=0.11.13",
 ]
+
+[tool.ruff]
+fix = true
+
+[tool.ruff.lint]
+select = ["I", "F401"]
+
+[tool.ruff.lint.isort]
+length-sort = true
+length-sort-straight = true
 
 [build-system]
 requires = ["hatchling"]

@@ -1,7 +1,6 @@
 import datetime as dt
 
-from dagster import Backoff, FreshnessPolicy, RetryPolicy
-
+from dagster import Backoff, RetryPolicy, FreshnessPolicy
 
 COINDESK_API_HOST = "https://data-api.coindesk.com"
 COINDESK_API_POOL = "coindesk-api"
