@@ -104,9 +104,11 @@ def clean_db(postgres_engine: Engine) -> Generator[Engine, None, None]:
 
 @pytest.fixture(autouse=True)
 def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "dagster_loaders.defs.kraken_market_data.time.sleep", lambda *_: None
-    )
+    for path in (
+        "dagster_loaders.defs.kraken.market_data.time.sleep",
+        "dagster_loaders.defs.coinbase.market_data.time.sleep",
+    ):
+        monkeypatch.setattr(path, lambda *_: None, raising=False)
 
 
 @pytest.fixture
@@ -117,11 +119,15 @@ def kraken_base_data(postgres_engine: Engine) -> dict[str, Any]:
     """
     yesterday = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).date()
     with Session(postgres_engine) as session:
-        provider_type = ProviderType(
-            name="CryptoCurrencyExchange", description="CryptoCurrencyExchange"
-        )
-        session.add(provider_type)
-        session.commit()
+        provider_type = session.execute(
+            select(ProviderType).where(ProviderType.name == "CryptoCurrencyExchange")
+        ).scalar_one_or_none()
+        if provider_type is None:
+            provider_type = ProviderType(
+                name="CryptoCurrencyExchange", description="CryptoCurrencyExchange"
+            )
+            session.add(provider_type)
+            session.commit()
 
         provider = Provider(
             name="Kraken", description="Kraken", provider_type_id=provider_type.id
@@ -129,19 +135,55 @@ def kraken_base_data(postgres_engine: Engine) -> dict[str, Any]:
         session.add(provider)
         session.commit()
 
-        crypto_type = AssetType(name="CryptoCurrency", description="CryptoCurrency")
-        fiat_type = AssetType(name="FiatCurrency", description="FiatCurrency")
-        session.add_all([crypto_type, fiat_type])
-        session.commit()
+        crypto_type = session.execute(
+            select(AssetType).where(AssetType.name == "CryptoCurrency")
+        ).scalar_one_or_none()
+        if crypto_type is None:
+            crypto_type = AssetType(name="CryptoCurrency", description="CryptoCurrency")
+            session.add(crypto_type)
+            session.commit()
 
-        btc = Asset(name="BTC", description="BTC", asset_type_id=crypto_type.id)
-        eth = Asset(name="ETH", description="ETH", asset_type_id=crypto_type.id)
-        usd = Asset(name="USD", description="USD", asset_type_id=fiat_type.id)
-        one_inch = Asset(
-            name="1INCH", description="1INCH", asset_type_id=crypto_type.id
-        )
-        session.add_all([btc, eth, usd, one_inch])
-        session.commit()
+        fiat_type = session.execute(
+            select(AssetType).where(AssetType.name == "FiatCurrency")
+        ).scalar_one_or_none()
+        if fiat_type is None:
+            fiat_type = AssetType(name="FiatCurrency", description="FiatCurrency")
+            session.add(fiat_type)
+            session.commit()
+
+        btc = session.execute(
+            select(Asset).where(Asset.name == "BTC")
+        ).scalar_one_or_none()
+        if btc is None:
+            btc = Asset(name="BTC", description="BTC", asset_type_id=crypto_type.id)
+            session.add(btc)
+            session.commit()
+
+        eth = session.execute(
+            select(Asset).where(Asset.name == "ETH")
+        ).scalar_one_or_none()
+        if eth is None:
+            eth = Asset(name="ETH", description="ETH", asset_type_id=crypto_type.id)
+            session.add(eth)
+            session.commit()
+
+        usd = session.execute(
+            select(Asset).where(Asset.name == "USD")
+        ).scalar_one_or_none()
+        if usd is None:
+            usd = Asset(name="USD", description="USD", asset_type_id=fiat_type.id)
+            session.add(usd)
+            session.commit()
+
+        one_inch = session.execute(
+            select(Asset).where(Asset.name == "1INCH")
+        ).scalar_one_or_none()
+        if one_inch is None:
+            one_inch = Asset(
+                name="1INCH", description="1INCH", asset_type_id=crypto_type.id
+            )
+            session.add(one_inch)
+            session.commit()
 
         session.add_all(
             [
@@ -192,6 +234,119 @@ def kraken_base_data(postgres_engine: Engine) -> dict[str, Any]:
             ).scalar_one(),
             "one_inch_asset_id": session.execute(
                 select(Asset.id).where(Asset.name == "1INCH")
+            ).scalar_one(),
+        }
+
+
+@pytest.fixture
+def coinbase_base_data(postgres_engine: Engine) -> dict[str, Any]:
+    """Seed the Coinbase provider plus three assets and provider-asset mappings.
+
+    Uses defensive lookups for ProviderType/AssetType/Asset rows so this fixture
+    can coexist with `kraken_base_data` in the same test (the same shared rows
+    would otherwise hit unique constraints).
+
+    Returns a dict of ids: provider_id, btc/eth/usd asset_ids.
+    """
+    yesterday = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).date()
+    with Session(postgres_engine) as session:
+        provider_type = session.execute(
+            select(ProviderType).where(ProviderType.name == "CryptoCurrencyExchange")
+        ).scalar_one_or_none()
+        if provider_type is None:
+            provider_type = ProviderType(
+                name="CryptoCurrencyExchange", description="CryptoCurrencyExchange"
+            )
+            session.add(provider_type)
+            session.commit()
+
+        provider = Provider(
+            name="Coinbase",
+            description="Coinbase",
+            provider_type_id=provider_type.id,
+        )
+        session.add(provider)
+        session.commit()
+
+        crypto_type = session.execute(
+            select(AssetType).where(AssetType.name == "CryptoCurrency")
+        ).scalar_one_or_none()
+        if crypto_type is None:
+            crypto_type = AssetType(name="CryptoCurrency", description="CryptoCurrency")
+            session.add(crypto_type)
+            session.commit()
+
+        fiat_type = session.execute(
+            select(AssetType).where(AssetType.name == "FiatCurrency")
+        ).scalar_one_or_none()
+        if fiat_type is None:
+            fiat_type = AssetType(name="FiatCurrency", description="FiatCurrency")
+            session.add(fiat_type)
+            session.commit()
+
+        btc = session.execute(
+            select(Asset).where(Asset.name == "BTC")
+        ).scalar_one_or_none()
+        if btc is None:
+            btc = Asset(name="BTC", description="BTC", asset_type_id=crypto_type.id)
+            session.add(btc)
+            session.commit()
+
+        eth = session.execute(
+            select(Asset).where(Asset.name == "ETH")
+        ).scalar_one_or_none()
+        if eth is None:
+            eth = Asset(name="ETH", description="ETH", asset_type_id=crypto_type.id)
+            session.add(eth)
+            session.commit()
+
+        usd = session.execute(
+            select(Asset).where(Asset.name == "USD")
+        ).scalar_one_or_none()
+        if usd is None:
+            usd = Asset(name="USD", description="USD", asset_type_id=fiat_type.id)
+            session.add(usd)
+            session.commit()
+
+        session.add_all(
+            [
+                ProviderAsset(
+                    date=yesterday,
+                    provider_id=provider.id,
+                    asset_id=btc.id,
+                    asset_code="BTC",
+                    is_active=True,
+                ),
+                ProviderAsset(
+                    date=yesterday,
+                    provider_id=provider.id,
+                    asset_id=eth.id,
+                    asset_code="ETH",
+                    is_active=True,
+                ),
+                ProviderAsset(
+                    date=yesterday,
+                    provider_id=provider.id,
+                    asset_id=usd.id,
+                    asset_code="USD",
+                    is_active=True,
+                ),
+            ]
+        )
+        session.commit()
+
+        return {
+            "provider_id": session.execute(
+                select(Provider.id).where(Provider.name == "Coinbase")
+            ).scalar_one(),
+            "btc_asset_id": session.execute(
+                select(Asset.id).where(Asset.name == "BTC")
+            ).scalar_one(),
+            "eth_asset_id": session.execute(
+                select(Asset.id).where(Asset.name == "ETH")
+            ).scalar_one(),
+            "usd_asset_id": session.execute(
+                select(Asset.id).where(Asset.name == "USD")
             ).scalar_one(),
         }
 

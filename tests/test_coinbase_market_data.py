@@ -9,34 +9,61 @@ from sqlalchemy.orm import Session
 from mc_postgres_db.models import ProviderAssetMarket
 
 from dagster_loaders.resources import PostgresResource
-from dagster_loaders.defs.kraken import market_data as kraken_market_data
-from dagster_loaders.defs.kraken.market_data import (
-    kraken_market_data_quality,
-    kraken_provider_asset_market,
+from dagster_loaders.defs.coinbase import market_data as coinbase_market_data
+from dagster_loaders.defs.coinbase.market_data import (
+    coinbase_market_data_quality,
+    coinbase_provider_asset_market,
 )
 
 
-def _stub_kraken(
-    asset_pairs: dict[str, dict[str, Any]],
-    market_data: dict[str, list[list[Any]]],
+def _candle(ts: int, value: str = "100") -> dict[str, str]:
+    return {
+        "start": str(ts),
+        "low": value,
+        "high": value,
+        "open": value,
+        "close": value,
+        "volume": value,
+    }
+
+
+def _stub_coinbase(
+    products: list[dict[str, Any]],
+    candles_by_product: dict[str, list[dict[str, str]]],
 ) -> None:
     responses.add(
         responses.GET,
-        kraken_market_data.ASSET_PAIRS_URL,
-        json={"result": asset_pairs},
+        coinbase_market_data.PRODUCTS_URL,
+        json={"products": products},
     )
-    for pair_code, rows in market_data.items():
+    for product_id, candles in candles_by_product.items():
         responses.add(
             responses.GET,
-            kraken_market_data.OHLC_URL,
-            json={"result": {pair_code: rows}, "error": []},
-            match=[responses.matchers.query_param_matcher({"pair": pair_code})],
+            coinbase_market_data.CANDLES_URL_TEMPLATE.format(product_id=product_id),
+            json={"candles": candles},
         )
+
+
+def _online_product(
+    product_id: str, base: str, quote: str, **overrides: Any
+) -> dict[str, Any]:
+    p = {
+        "product_id": product_id,
+        "base_currency_id": base,
+        "quote_currency_id": quote,
+        "status": "online",
+        "is_disabled": False,
+        "trading_disabled": False,
+        "view_only": False,
+        "auction_mode": False,
+    }
+    p.update(overrides)
+    return p
 
 
 def _materialize(engine: Engine):
     return materialize(
-        [kraken_provider_asset_market],
+        [coinbase_provider_asset_market],
         resources={
             "postgres": PostgresResource(
                 url=engine.url.render_as_string(hide_password=False)
@@ -47,17 +74,17 @@ def _materialize(engine: Engine):
 
 @responses.activate
 def test_materialize_writes_rows_into_empty_db(
-    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+    postgres_engine: Engine, coinbase_base_data: dict[str, Any]
 ) -> None:
-    ts = int(dt.datetime.now().timestamp())
-    _stub_kraken(
-        asset_pairs={
-            "XXBTZUSD": {"base": "XXBT", "quote": "ZUSD"},
-            "XETHZUSD": {"base": "XETH", "quote": "ZUSD"},
-        },
-        market_data={
-            "XXBTZUSD": [[ts, "100", "100", "100", "100", "100", "100", 100]],
-            "XETHZUSD": [[ts, "200", "200", "200", "200", "200", "200", 100]],
+    ts = int(dt.datetime.now().replace(second=0, microsecond=0).timestamp())
+    _stub_coinbase(
+        products=[
+            _online_product("BTC-USD", "BTC", "USD"),
+            _online_product("ETH-USD", "ETH", "USD"),
+        ],
+        candles_by_product={
+            "BTC-USD": [_candle(ts, "100")],
+            "ETH-USD": [_candle(ts, "200")],
         },
     )
 
@@ -70,19 +97,19 @@ def test_materialize_writes_rows_into_empty_db(
 
         btc = session.execute(
             select(ProviderAssetMarket).where(
-                ProviderAssetMarket.from_asset_id == kraken_base_data["usd_asset_id"],
-                ProviderAssetMarket.to_asset_id == kraken_base_data["btc_asset_id"],
+                ProviderAssetMarket.from_asset_id == coinbase_base_data["usd_asset_id"],
+                ProviderAssetMarket.to_asset_id == coinbase_base_data["btc_asset_id"],
             )
         ).scalar_one()
         assert btc.open == 100.0
         assert btc.close == 100.0
         assert btc.volume == 100.0
-        assert btc.provider_id == kraken_base_data["provider_id"]
+        assert btc.provider_id == coinbase_base_data["provider_id"]
 
         eth = session.execute(
             select(ProviderAssetMarket).where(
-                ProviderAssetMarket.from_asset_id == kraken_base_data["usd_asset_id"],
-                ProviderAssetMarket.to_asset_id == kraken_base_data["eth_asset_id"],
+                ProviderAssetMarket.from_asset_id == coinbase_base_data["usd_asset_id"],
+                ProviderAssetMarket.to_asset_id == coinbase_base_data["eth_asset_id"],
             )
         ).scalar_one()
         assert eth.open == 200.0
@@ -90,23 +117,19 @@ def test_materialize_writes_rows_into_empty_db(
 
 @responses.activate
 def test_upsert_overwrites_existing(
-    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+    postgres_engine: Engine, coinbase_base_data: dict[str, Any]
 ) -> None:
-    ts = int(dt.datetime.now().timestamp())
-    _stub_kraken(
-        asset_pairs={"XXBTZUSD": {"base": "XXBT", "quote": "ZUSD"}},
-        market_data={
-            "XXBTZUSD": [[ts, "100", "100", "100", "100", "100", "100", 1]],
-        },
+    ts = int(dt.datetime.now().replace(second=0, microsecond=0).timestamp())
+    _stub_coinbase(
+        products=[_online_product("BTC-USD", "BTC", "USD")],
+        candles_by_product={"BTC-USD": [_candle(ts, "100")]},
     )
     assert _materialize(postgres_engine).success
 
     responses.reset()
-    _stub_kraken(
-        asset_pairs={"XXBTZUSD": {"base": "XXBT", "quote": "ZUSD"}},
-        market_data={
-            "XXBTZUSD": [[ts, "999", "999", "999", "999", "999", "999", 1]],
-        },
+    _stub_coinbase(
+        products=[_online_product("BTC-USD", "BTC", "USD")],
+        candles_by_product={"BTC-USD": [_candle(ts, "999")]},
     )
     assert _materialize(postgres_engine).success
 
@@ -118,18 +141,16 @@ def test_upsert_overwrites_existing(
 
 
 @responses.activate
-def test_skips_pairs_not_in_asset_map(
-    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+def test_skips_products_not_in_asset_map(
+    postgres_engine: Engine, coinbase_base_data: dict[str, Any]
 ) -> None:
-    ts = int(dt.datetime.now().timestamp())
-    _stub_kraken(
-        asset_pairs={
-            "XXBTZUSD": {"base": "XXBT", "quote": "ZUSD"},
-            "DOGEZUSD": {"base": "DOGE", "quote": "ZUSD"},
-        },
-        market_data={
-            "XXBTZUSD": [[ts, "100", "100", "100", "100", "100", "100", 1]],
-        },
+    ts = int(dt.datetime.now().replace(second=0, microsecond=0).timestamp())
+    _stub_coinbase(
+        products=[
+            _online_product("BTC-USD", "BTC", "USD"),
+            _online_product("DOGE-USD", "DOGE", "USD"),
+        ],
+        candles_by_product={"BTC-USD": [_candle(ts, "100")]},
     )
 
     assert _materialize(postgres_engine).success
@@ -137,29 +158,33 @@ def test_skips_pairs_not_in_asset_map(
     with Session(postgres_engine) as session:
         rows = session.execute(select(ProviderAssetMarket)).scalars().all()
         assert len(rows) == 1
-        assert rows[0].to_asset_id == kraken_base_data["btc_asset_id"]
+        assert rows[0].to_asset_id == coinbase_base_data["btc_asset_id"]
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"status": "offline"},
+        {"is_disabled": True},
+        {"trading_disabled": True},
+        {"view_only": True},
+        {"auction_mode": True},
+    ],
+)
 @responses.activate
-def test_filters_non_international_venue(
-    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+def test_filters_disabled_products(
+    postgres_engine: Engine,
+    coinbase_base_data: dict[str, Any],
+    overrides: dict[str, Any],
 ) -> None:
-    ts = int(dt.datetime.now().timestamp())
-    _stub_kraken(
-        asset_pairs={
-            "XXBTZUSD": {
-                "base": "XXBT",
-                "quote": "ZUSD",
-                "execution_venue": "international",
-            },
-            "XBTUSD:BTNL": {
-                "base": "XXBT",
-                "quote": "ZUSD",
-                "execution_venue": "bitnomial_exchange",
-            },
-        },
-        market_data={
-            "XXBTZUSD": [[ts, "100", "100", "100", "100", "100", "100", 1]],
+    ts = int(dt.datetime.now().replace(second=0, microsecond=0).timestamp())
+    _stub_coinbase(
+        products=[
+            _online_product("BTC-USD", "BTC", "USD"),
+            _online_product("ETH-USD", "ETH", "USD", **overrides),
+        ],
+        candles_by_product={
+            "BTC-USD": [_candle(ts, "100")],
         },
     )
 
@@ -168,7 +193,7 @@ def test_filters_non_international_venue(
     with Session(postgres_engine) as session:
         rows = session.execute(select(ProviderAssetMarket)).scalars().all()
         assert len(rows) == 1
-        assert rows[0].close == 100.0
+        assert rows[0].to_asset_id == coinbase_base_data["btc_asset_id"]
 
 
 @pytest.mark.parametrize("batch_size", [1, 3, 100])
@@ -176,27 +201,21 @@ def test_filters_non_international_venue(
 def test_batches_large_dataset(
     monkeypatch: pytest.MonkeyPatch,
     postgres_engine: Engine,
-    kraken_base_data: dict[str, Any],
+    coinbase_base_data: dict[str, Any],
     batch_size: int,
 ) -> None:
-    monkeypatch.setattr(kraken_market_data, "BATCH_SIZE", batch_size)
+    monkeypatch.setattr(coinbase_market_data, "BATCH_SIZE", batch_size)
 
-    base_ts = int(dt.datetime.now().timestamp())
-    n_per_pair = 5
-    _stub_kraken(
-        asset_pairs={
-            "XXBTZUSD": {"base": "XXBT", "quote": "ZUSD"},
-            "XETHZUSD": {"base": "XETH", "quote": "ZUSD"},
-        },
-        market_data={
-            "XXBTZUSD": [
-                [base_ts + 60 * i, "1", "1", "1", "1", "1", "1", 1]
-                for i in range(n_per_pair)
-            ],
-            "XETHZUSD": [
-                [base_ts + 60 * i, "2", "2", "2", "2", "2", "2", 1]
-                for i in range(n_per_pair)
-            ],
+    base_ts = int(dt.datetime.now().replace(second=0, microsecond=0).timestamp())
+    n_per_product = 5
+    _stub_coinbase(
+        products=[
+            _online_product("BTC-USD", "BTC", "USD"),
+            _online_product("ETH-USD", "ETH", "USD"),
+        ],
+        candles_by_product={
+            "BTC-USD": [_candle(base_ts + 60 * i, "1") for i in range(n_per_product)],
+            "ETH-USD": [_candle(base_ts + 60 * i, "2") for i in range(n_per_product)],
         },
     )
 
@@ -204,13 +223,13 @@ def test_batches_large_dataset(
 
     with Session(postgres_engine) as session:
         rows = session.execute(select(ProviderAssetMarket)).scalars().all()
-        assert len(rows) == n_per_pair * 2
+        assert len(rows) == n_per_product * 2
 
 
 def _run_check_only(engine: Engine):
     return materialize(
-        [kraken_provider_asset_market, kraken_market_data_quality],
-        selection=AssetSelection.checks(kraken_market_data_quality),
+        [coinbase_provider_asset_market, coinbase_market_data_quality],
+        selection=AssetSelection.checks(coinbase_market_data_quality),
         resources={
             "postgres": PostgresResource(
                 url=engine.url.render_as_string(hide_password=False)
@@ -247,16 +266,13 @@ def _seed_market_rows(
 
 @responses.activate
 def test_data_quality_check_passes_after_materialize(
-    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+    postgres_engine: Engine, coinbase_base_data: dict[str, Any]
 ) -> None:
-    # Whole-minute timestamp: round down to the minute.
     now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
     ts = int(now.timestamp())
-    _stub_kraken(
-        asset_pairs={"XXBTZUSD": {"base": "XXBT", "quote": "ZUSD"}},
-        market_data={
-            "XXBTZUSD": [[ts, "100", "100", "100", "100", "100", "100", 1]],
-        },
+    _stub_coinbase(
+        products=[_online_product("BTC-USD", "BTC", "USD")],
+        candles_by_product={"BTC-USD": [_candle(ts, "100")]},
     )
     assert _materialize(postgres_engine).success
 
@@ -272,7 +288,7 @@ def test_data_quality_check_passes_after_materialize(
 
 
 def test_data_quality_check_fails_when_table_empty(
-    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+    postgres_engine: Engine, coinbase_base_data: dict[str, Any]
 ) -> None:
     result = _run_check_only(postgres_engine)
     assert result.success
@@ -283,17 +299,17 @@ def test_data_quality_check_fails_when_table_empty(
 
 
 def test_data_quality_check_fails_on_off_minute_row(
-    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+    postgres_engine: Engine, coinbase_base_data: dict[str, Any]
 ) -> None:
     base = dt.datetime.now(dt.timezone.utc).replace(
         second=0, microsecond=0, tzinfo=None
     )
     _seed_market_rows(
         postgres_engine,
-        kraken_base_data,
+        coinbase_base_data,
         [
             base,
-            base + dt.timedelta(seconds=37),  # off-minute
+            base + dt.timedelta(seconds=37),
             base + dt.timedelta(minutes=2),
         ],
     )
@@ -306,15 +322,14 @@ def test_data_quality_check_fails_on_off_minute_row(
 
 
 def test_data_quality_check_fails_on_gap(
-    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+    postgres_engine: Engine, coinbase_base_data: dict[str, Any]
 ) -> None:
     base = dt.datetime.now(dt.timezone.utc).replace(
         second=0, microsecond=0, tzinfo=None
     )
-    # minutes 0, 1, 3 — minute 2 missing
     _seed_market_rows(
         postgres_engine,
-        kraken_base_data,
+        coinbase_base_data,
         [
             base,
             base + dt.timedelta(minutes=1),
@@ -332,24 +347,23 @@ def test_data_quality_check_fails_on_gap(
     assert gappy[0]["missing"] == 1
 
 
-def test_check_ignores_coinbase_rows(
+def test_check_ignores_kraken_rows(
     postgres_engine: Engine,
-    kraken_base_data: dict[str, Any],
     coinbase_base_data: dict[str, Any],
+    kraken_base_data: dict[str, Any],
 ) -> None:
-    """Coinbase rows in the table must not affect the Kraken check."""
+    """Kraken rows in the table must not affect the Coinbase check."""
     base = dt.datetime.now(dt.timezone.utc).replace(
         second=0, microsecond=0, tzinfo=None
     )
-    # Seed only Coinbase rows — the Kraken check should still report empty.
     with Session(postgres_engine) as session:
         session.add_all(
             [
                 ProviderAssetMarket(
                     timestamp=base,
-                    provider_id=coinbase_base_data["provider_id"],
-                    from_asset_id=coinbase_base_data["usd_asset_id"],
-                    to_asset_id=coinbase_base_data["btc_asset_id"],
+                    provider_id=kraken_base_data["provider_id"],
+                    from_asset_id=kraken_base_data["usd_asset_id"],
+                    to_asset_id=kraken_base_data["btc_asset_id"],
                     open=100.0,
                     high=100.0,
                     low=100.0,

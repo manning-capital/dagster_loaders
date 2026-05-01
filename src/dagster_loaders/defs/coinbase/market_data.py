@@ -19,155 +19,140 @@ from dagster import (
     asset_check,
     define_asset_job,
 )
-from sqlalchemy import Engine, func, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
-from mc_postgres_db.models import Asset, Provider, ProviderAsset, ProviderAssetMarket
+from mc_postgres_db.models import Provider, ProviderAssetMarket
 from mc_postgres_db.operations import set_data
 
 from dagster_loaders.resources import PostgresResource
+from dagster_loaders.defs.provider_assets import provider_asset_map
 
-KRAKEN_POOL = "kraken-api"
-KRAKEN_RATE_LIMIT_SECONDS = 1.0
+COINBASE_POOL = "coinbase-api"
+COINBASE_RATE_LIMIT_SECONDS = 0.4
 BATCH_SIZE = 5000
-ASSET_PAIRS_URL = "https://api.kraken.com/0/public/AssetPairs"
-OHLC_URL = "https://api.kraken.com/0/public/OHLC"
+LOOKBACK_MINUTES = 60
+GRANULARITY = "ONE_MINUTE"
+PRODUCTS_URL = "https://api.coinbase.com/api/v3/brokerage/market/products"
+CANDLES_URL_TEMPLATE = (
+    "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}/candles"
+)
 
 
-def _request_kraken(
+def _request_coinbase(
     url: str, params: Optional[dict[str, Any]] = None
 ) -> dict[str, Any]:
     resp = requests.get(url, params=params, timeout=30)
     resp.raise_for_status()
     body = resp.json()
-    errors = body.get("error") or []
-    if errors:
-        raise RuntimeError(f"Kraken {url} returned errors: {errors}")
+    if isinstance(body, dict) and body.get("error"):
+        raise RuntimeError(f"Coinbase {url} returned error: {body['error']}")
     return body
 
 
-def _kraken_provider_asset_map(
-    engine: Engine, as_of: dt.date
-) -> tuple[int, dict[str, int]]:
-    with Session(engine) as session:
-        provider_id = session.execute(
-            select(Provider.id).where(Provider.name == "Kraken")
-        ).scalar_one()
-
-        subq = (
-            select(
-                ProviderAsset.asset_code,
-                ProviderAsset.provider_id,
-                func.max(ProviderAsset.date).label("max_date"),
-            )
-            .where(ProviderAsset.date <= as_of, ProviderAsset.is_active.is_(True))
-            .group_by(ProviderAsset.asset_code, ProviderAsset.provider_id)
-            .subquery()
-        )
-        q = (
-            select(ProviderAsset.asset_code, ProviderAsset.asset_id)
-            .join(
-                subq,
-                (ProviderAsset.asset_code == subq.c.asset_code)
-                & (ProviderAsset.provider_id == subq.c.provider_id)
-                & (ProviderAsset.date == subq.c.max_date),
-            )
-            .join(Asset, Asset.id == ProviderAsset.asset_id)
-            .where(ProviderAsset.provider_id == provider_id, Asset.is_active.is_(True))
-        )
-        rows = session.execute(q).all()
-
-    return provider_id, {code: aid for code, aid in rows}
-
-
 @asset(
-    pool=KRAKEN_POOL,
+    pool=COINBASE_POOL,
     group_name="market_data",
     kinds={"python", "postgres"},
     owners=["glynfinck@gmail.com"],
-    tags={"domain": "market-data", "provider": "kraken"},
+    tags={"domain": "market-data", "provider": "coinbase"},
     retry_policy=RetryPolicy(max_retries=3, delay=5.0, backoff=Backoff.EXPONENTIAL),
     freshness_policy=FreshnessPolicy.time_window(
         fail_window=dt.timedelta(minutes=60),
         warn_window=dt.timedelta(minutes=45),
     ),
     description=(
-        "Kraken OHLCV candles upserted into `provider_asset_market`.\n\n"
-        "Pulls `GET /0/public/AssetPairs` (filtered to `execution_venue == "
-        '"international"`), then `GET /0/public/OHLC` per pair whose '
-        "base+quote both map to active rows in `provider_asset` for the "
-        "Kraken provider. Rows are deduped on PK and upserted in batches "
-        "of 5000 to stay under Postgres's bind-parameter cap."
+        "Coinbase OHLCV candles upserted into `provider_asset_market`.\n\n"
+        "Pulls `GET /api/v3/brokerage/market/products` (filtered to online, "
+        "non-disabled spot products), then `GET "
+        "/api/v3/brokerage/market/products/{product_id}/candles` per product "
+        "whose base+quote both map to active rows in `provider_asset` for "
+        "the Coinbase provider. Window is the last 60 minutes at "
+        "ONE_MINUTE granularity. Rows are deduped on PK and upserted in "
+        "batches of 5000 to stay under Postgres's bind-parameter cap."
     ),
 )
-def kraken_provider_asset_market(
+def coinbase_provider_asset_market(
     context: AssetExecutionContext, postgres: PostgresResource
 ) -> MaterializeResult:
     as_of = dt.date.today()
     engine = postgres.get_engine()
-    skipped_pairs: list[str] = []
+    skipped_products: list[str] = []
     try:
-        provider_id, asset_map = _kraken_provider_asset_map(engine, as_of)
-        context.log.info(f"Loaded {len(asset_map)} Kraken provider assets")
+        provider_id, asset_map = provider_asset_map(engine, "Coinbase", as_of)
+        context.log.info(f"Loaded {len(asset_map)} Coinbase provider assets")
 
-        time.sleep(KRAKEN_RATE_LIMIT_SECONDS)
-        pairs_body = _request_kraken(ASSET_PAIRS_URL)
-        all_pairs_count = len(pairs_body["result"])
-        pairs = [
-            (code, info["quote"], info["base"])
-            for code, info in pairs_body["result"].items()
-            if info.get("execution_venue", "international") == "international"
-            and info["quote"] in asset_map
-            and info["base"] in asset_map
+        time.sleep(COINBASE_RATE_LIMIT_SECONDS)
+        products_body = _request_coinbase(PRODUCTS_URL)
+        all_products = products_body.get("products", [])
+        products = [
+            p
+            for p in all_products
+            if p.get("status") == "online"
+            and not p.get("is_disabled")
+            and not p.get("trading_disabled")
+            and not p.get("view_only")
+            and not p.get("auction_mode")
+            and p.get("base_currency_id") in asset_map
+            and p.get("quote_currency_id") in asset_map
         ]
         context.log.info(
-            f"Kraken returned {all_pairs_count} pairs; "
-            f"{len(pairs)} match venue + asset map filters: "
-            f"{[code for code, _, _ in pairs]}"
+            f"Coinbase returned {len(all_products)} products; "
+            f"{len(products)} match status + asset map filters: "
+            f"{[p['product_id'] for p in products]}"
         )
 
+        end_ts = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        start_ts = end_ts - LOOKBACK_MINUTES * 60
+
         frames: list[pd.DataFrame] = []
-        total = len(pairs)
-        for idx, (code, from_code, to_code) in enumerate(pairs, start=1):
+        total = len(products)
+        for idx, product in enumerate(products, start=1):
+            product_id = product["product_id"]
+            base_code = product["base_currency_id"]
+            quote_code = product["quote_currency_id"]
             try:
                 context.log.info(
-                    f"[{idx}/{total}] Requesting OHLC for {code} ({from_code} -> {to_code})"
+                    f"[{idx}/{total}] Requesting candles for {product_id} "
+                    f"({quote_code} -> {base_code})"
                 )
-                time.sleep(KRAKEN_RATE_LIMIT_SECONDS)
-                ohlc_body = _request_kraken(OHLC_URL, params={"pair": code})
-                rows = ohlc_body["result"][code]
-                df = pd.DataFrame(
-                    rows,
-                    columns=[
-                        "timestamp",
-                        "open",
-                        "high",
-                        "low",
-                        "close",
-                        "vwap",
-                        "volume",
-                        "count",
-                    ],
+                time.sleep(COINBASE_RATE_LIMIT_SECONDS)
+                candles_body = _request_coinbase(
+                    CANDLES_URL_TEMPLATE.format(product_id=product_id),
+                    params={
+                        "start": str(start_ts),
+                        "end": str(end_ts),
+                        "granularity": GRANULARITY,
+                    },
                 )
-                df = df.drop(columns=["vwap", "count"])
-                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+                candles = candles_body.get("candles", [])
+                if not candles:
+                    context.log.info(
+                        f"[{idx}/{total}] No candles returned for {product_id}"
+                    )
+                    continue
+                df = pd.DataFrame(candles)
+                df["timestamp"] = pd.to_datetime(df["start"].astype(int), unit="s")
                 for c in ("open", "high", "low", "close", "volume"):
                     df[c] = df[c].astype(float)
-                df["from_asset_id"] = asset_map[from_code]
-                df["to_asset_id"] = asset_map[to_code]
+                df = df.drop(columns=["start"])
+                df["from_asset_id"] = asset_map[quote_code]
+                df["to_asset_id"] = asset_map[base_code]
                 df["provider_id"] = provider_id
                 frames.append(df)
-                context.log.info(f"[{idx}/{total}] Fetched {len(df)} rows for {code}")
+                context.log.info(
+                    f"[{idx}/{total}] Fetched {len(df)} rows for {product_id}"
+                )
             except Exception as e:
-                context.log.error(f"[{idx}/{total}] Skipping pair {code}: {e}")
-                skipped_pairs.append(code)
+                context.log.error(f"[{idx}/{total}] Skipping product {product_id}: {e}")
+                skipped_products.append(product_id)
 
         if not frames:
             context.log.info("No rows to write.")
             return MaterializeResult(
                 metadata={
                     "row_count": 0,
-                    "pair_count": len(pairs),
-                    "skipped_pairs": MetadataValue.json(skipped_pairs),
+                    "product_count": len(products),
+                    "skipped_products": MetadataValue.json(skipped_products),
                     "table": ProviderAssetMarket.__tablename__,
                     "as_of": MetadataValue.text(as_of.isoformat()),
                 }
@@ -189,8 +174,8 @@ def kraken_provider_asset_market(
         return MaterializeResult(
             metadata={
                 "row_count": len(data),
-                "pair_count": len(pairs),
-                "skipped_pairs": MetadataValue.json(skipped_pairs),
+                "product_count": len(products),
+                "skipped_products": MetadataValue.json(skipped_products),
                 "table": ProviderAssetMarket.__tablename__,
                 "as_of": MetadataValue.text(as_of.isoformat()),
                 "min_timestamp": MetadataValue.text(
@@ -207,19 +192,24 @@ def kraken_provider_asset_market(
 
 
 @asset_check(
-    asset=kraken_provider_asset_market,
-    name="kraken_market_data_quality",
+    asset=coinbase_provider_asset_market,
+    name="coinbase_market_data_quality",
     description=(
         "Within the recent 2h window: rows present, all close prices > 0, "
         "every timestamp on a whole-minute boundary, and per-pair points "
-        "uniformly spaced inside [min, max] (edges ignored)."
+        "uniformly spaced inside [min, max] (edges ignored). Scoped to "
+        "the Coinbase provider only."
     ),
     blocking=False,
 )
-def kraken_market_data_quality(postgres: PostgresResource) -> AssetCheckResult:
+def coinbase_market_data_quality(postgres: PostgresResource) -> AssetCheckResult:
     engine = postgres.get_engine()
     try:
         with Session(engine) as session:
+            provider_id = session.execute(
+                select(Provider.id).where(Provider.name == "Coinbase")
+            ).scalar_one()
+
             recent_cutoff = dt.datetime.now(dt.timezone.utc).replace(
                 tzinfo=None
             ) - dt.timedelta(hours=2)
@@ -227,12 +217,16 @@ def kraken_market_data_quality(postgres: PostgresResource) -> AssetCheckResult:
             recent_rows = session.execute(
                 select(func.count())
                 .select_from(ProviderAssetMarket)
-                .where(ProviderAssetMarket.timestamp >= recent_cutoff)
+                .where(
+                    ProviderAssetMarket.provider_id == provider_id,
+                    ProviderAssetMarket.timestamp >= recent_cutoff,
+                )
             ).scalar_one()
 
             min_close = session.execute(
                 select(func.min(ProviderAssetMarket.close)).where(
-                    ProviderAssetMarket.timestamp >= recent_cutoff
+                    ProviderAssetMarket.provider_id == provider_id,
+                    ProviderAssetMarket.timestamp >= recent_cutoff,
                 )
             ).scalar_one()
 
@@ -240,6 +234,7 @@ def kraken_market_data_quality(postgres: PostgresResource) -> AssetCheckResult:
                 select(func.count())
                 .select_from(ProviderAssetMarket)
                 .where(
+                    ProviderAssetMarket.provider_id == provider_id,
                     ProviderAssetMarket.timestamp >= recent_cutoff,
                     func.extract("second", ProviderAssetMarket.timestamp) != 0,
                 )
@@ -254,7 +249,10 @@ def kraken_market_data_quality(postgres: PostgresResource) -> AssetCheckResult:
                     func.max(ProviderAssetMarket.timestamp).label("max_ts"),
                     func.count().label("actual"),
                 )
-                .where(ProviderAssetMarket.timestamp >= recent_cutoff)
+                .where(
+                    ProviderAssetMarket.provider_id == provider_id,
+                    ProviderAssetMarket.timestamp >= recent_cutoff,
+                )
                 .group_by(
                     ProviderAssetMarket.from_asset_id,
                     ProviderAssetMarket.to_asset_id,
@@ -309,21 +307,21 @@ def kraken_market_data_quality(postgres: PostgresResource) -> AssetCheckResult:
     )
 
 
-kraken_market_job = define_asset_job(
-    name="kraken_market_job",
-    selection=[kraken_provider_asset_market],
+coinbase_market_job = define_asset_job(
+    name="coinbase_market_job",
+    selection=[coinbase_provider_asset_market],
 )
 
-kraken_market_schedule = ScheduleDefinition(
-    name="kraken_market_every_30min",
+coinbase_market_schedule = ScheduleDefinition(
+    name="coinbase_market_every_30min",
     cron_schedule="*/30 * * * *",
-    job=kraken_market_job,
+    job=coinbase_market_job,
 )
 
 
 defs = Definitions(
-    assets=[kraken_provider_asset_market],
-    asset_checks=[kraken_market_data_quality],
-    jobs=[kraken_market_job],
-    schedules=[kraken_market_schedule],
+    assets=[coinbase_provider_asset_market],
+    asset_checks=[coinbase_market_data_quality],
+    jobs=[coinbase_market_job],
+    schedules=[coinbase_market_schedule],
 )
