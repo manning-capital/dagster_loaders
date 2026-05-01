@@ -1,6 +1,7 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import pandas as pd
+from dagster import MetadataValue
 
 
 def compare_dataframes(
@@ -133,3 +134,24 @@ def compare_dataframes(
         )
 
     return records_in_1_not_2, records_in_2_not_1, exact_matches, different_records
+
+
+def df_to_md_metadata(
+    df: pd.DataFrame,
+    *,
+    head: Optional[int] = None,
+    empty_placeholder: str = "(empty)",
+) -> MetadataValue:
+    """Render a DataFrame as Markdown for Dagster asset/check metadata.
+
+    Mirrors the existing `preview` convention used by Coindesk/Kraken/Coinbase
+    assets: ``MetadataValue.md(df.head().to_markdown(index=False))``.
+
+    - `head=None` renders the whole frame (use for bounded result sets).
+    - `head=N` renders only the first N rows (use for previews of large frames).
+    - Empty frames render as `empty_placeholder` so the UI shows something readable.
+    """
+    if df.empty:
+        return MetadataValue.md(empty_placeholder)
+    rendered = df.head(head) if head is not None else df
+    return MetadataValue.md(rendered.to_markdown(index=False))

@@ -1,6 +1,6 @@
 import time
 import datetime as dt
-from typing import Any, Optional
+from typing import Any, Final, Optional
 
 import pandas as pd
 import requests
@@ -12,25 +12,24 @@ from dagster import (
     FreshnessPolicy,
     AssetCheckResult,
     MaterializeResult,
-    AssetCheckSeverity,
     ScheduleDefinition,
     AssetExecutionContext,
     asset,
     asset_check,
     define_asset_job,
 )
-from sqlalchemy import Engine, func, select
-from sqlalchemy.orm import Session
-from mc_postgres_db.models import Asset, Provider, ProviderAsset, ProviderAssetMarket
+from mc_postgres_db.models import ProviderAssetMarket
 from mc_postgres_db.operations import set_data
 
 from dagster_loaders.resources import PostgresResource
+from dagster_loaders.defs.data_quality import provider_market_data_quality
+from dagster_loaders.defs.provider_assets import provider_asset_map
 
-KRAKEN_POOL = "kraken-api"
-KRAKEN_RATE_LIMIT_SECONDS = 1.0
-BATCH_SIZE = 5000
-ASSET_PAIRS_URL = "https://api.kraken.com/0/public/AssetPairs"
-OHLC_URL = "https://api.kraken.com/0/public/OHLC"
+KRAKEN_POOL: Final[str] = "kraken-api"
+KRAKEN_RATE_LIMIT_SECONDS: Final[float] = 1.0
+BATCH_SIZE: int = 5000
+ASSET_PAIRS_URL: Final[str] = "https://api.kraken.com/0/public/AssetPairs"
+OHLC_URL: Final[str] = "https://api.kraken.com/0/public/OHLC"
 
 
 def _request_kraken(
@@ -43,40 +42,6 @@ def _request_kraken(
     if errors:
         raise RuntimeError(f"Kraken {url} returned errors: {errors}")
     return body
-
-
-def _kraken_provider_asset_map(
-    engine: Engine, as_of: dt.date
-) -> tuple[int, dict[str, int]]:
-    with Session(engine) as session:
-        provider_id = session.execute(
-            select(Provider.id).where(Provider.name == "Kraken")
-        ).scalar_one()
-
-        subq = (
-            select(
-                ProviderAsset.asset_code,
-                ProviderAsset.provider_id,
-                func.max(ProviderAsset.date).label("max_date"),
-            )
-            .where(ProviderAsset.date <= as_of, ProviderAsset.is_active.is_(True))
-            .group_by(ProviderAsset.asset_code, ProviderAsset.provider_id)
-            .subquery()
-        )
-        q = (
-            select(ProviderAsset.asset_code, ProviderAsset.asset_id)
-            .join(
-                subq,
-                (ProviderAsset.asset_code == subq.c.asset_code)
-                & (ProviderAsset.provider_id == subq.c.provider_id)
-                & (ProviderAsset.date == subq.c.max_date),
-            )
-            .join(Asset, Asset.id == ProviderAsset.asset_id)
-            .where(ProviderAsset.provider_id == provider_id, Asset.is_active.is_(True))
-        )
-        rows = session.execute(q).all()
-
-    return provider_id, {code: aid for code, aid in rows}
 
 
 @asset(
@@ -106,7 +71,7 @@ def kraken_provider_asset_market(
     engine = postgres.get_engine()
     skipped_pairs: list[str] = []
     try:
-        provider_id, asset_map = _kraken_provider_asset_map(engine, as_of)
+        provider_id, asset_map = provider_asset_map(engine, "Kraken", as_of)
         context.log.info(f"Loaded {len(asset_map)} Kraken provider assets")
 
         time.sleep(KRAKEN_RATE_LIMIT_SECONDS)
@@ -211,102 +176,18 @@ def kraken_provider_asset_market(
     name="kraken_market_data_quality",
     description=(
         "Within the recent 2h window: rows present, all close prices > 0, "
-        "every timestamp on a whole-minute boundary, and per-pair points "
-        "uniformly spaced inside [min, max] (edges ignored)."
+        "every timestamp on a whole-minute boundary, and no per-pair density "
+        "drop below 50% of the pair's own 30-day baseline. Scoped to the "
+        "Kraken provider only."
     ),
     blocking=False,
 )
 def kraken_market_data_quality(postgres: PostgresResource) -> AssetCheckResult:
     engine = postgres.get_engine()
     try:
-        with Session(engine) as session:
-            recent_cutoff = dt.datetime.now(dt.timezone.utc).replace(
-                tzinfo=None
-            ) - dt.timedelta(hours=2)
-
-            recent_rows = session.execute(
-                select(func.count())
-                .select_from(ProviderAssetMarket)
-                .where(ProviderAssetMarket.timestamp >= recent_cutoff)
-            ).scalar_one()
-
-            min_close = session.execute(
-                select(func.min(ProviderAssetMarket.close)).where(
-                    ProviderAssetMarket.timestamp >= recent_cutoff
-                )
-            ).scalar_one()
-
-            off_minute_rows = session.execute(
-                select(func.count())
-                .select_from(ProviderAssetMarket)
-                .where(
-                    ProviderAssetMarket.timestamp >= recent_cutoff,
-                    func.extract("second", ProviderAssetMarket.timestamp) != 0,
-                )
-            ).scalar_one()
-
-            pair_stats = session.execute(
-                select(
-                    ProviderAssetMarket.from_asset_id,
-                    ProviderAssetMarket.to_asset_id,
-                    ProviderAssetMarket.provider_id,
-                    func.min(ProviderAssetMarket.timestamp).label("min_ts"),
-                    func.max(ProviderAssetMarket.timestamp).label("max_ts"),
-                    func.count().label("actual"),
-                )
-                .where(ProviderAssetMarket.timestamp >= recent_cutoff)
-                .group_by(
-                    ProviderAssetMarket.from_asset_id,
-                    ProviderAssetMarket.to_asset_id,
-                    ProviderAssetMarket.provider_id,
-                )
-            ).all()
+        return provider_market_data_quality(engine, "Kraken")
     finally:
         engine.dispose()
-
-    gappy_pairs: list[dict[str, Any]] = []
-    for row in pair_stats:
-        if row.actual <= 1:
-            continue
-        expected = int((row.max_ts - row.min_ts).total_seconds() // 60) + 1
-        if row.actual < expected:
-            gappy_pairs.append(
-                {
-                    "from_asset_id": row.from_asset_id,
-                    "to_asset_id": row.to_asset_id,
-                    "provider_id": row.provider_id,
-                    "actual": row.actual,
-                    "expected": expected,
-                    "missing": expected - row.actual,
-                }
-            )
-
-    failures: list[str] = []
-    if recent_rows == 0:
-        failures.append("no rows with timestamp in the last 2h")
-    if min_close is not None and min_close <= 0:
-        failures.append(f"min(close) = {min_close} (expected > 0)")
-    if off_minute_rows > 0:
-        failures.append(
-            f"{off_minute_rows} rows are not aligned to a whole-minute boundary"
-        )
-    if gappy_pairs:
-        failures.append(
-            f"{len(gappy_pairs)} pair(s) have minute gaps inside the recent window"
-        )
-
-    return AssetCheckResult(
-        passed=not failures,
-        severity=AssetCheckSeverity.WARN,
-        description="; ".join(failures) if failures else "ok",
-        metadata={
-            "rows_in_last_2h": recent_rows,
-            "min_close_price": MetadataValue.float(float(min_close or 0.0)),
-            "off_minute_rows": off_minute_rows,
-            "gappy_pairs_count": len(gappy_pairs),
-            "gappy_pairs": MetadataValue.json(gappy_pairs),
-        },
-    )
 
 
 kraken_market_job = define_asset_job(
