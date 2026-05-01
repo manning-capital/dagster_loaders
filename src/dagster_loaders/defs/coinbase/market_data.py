@@ -1,6 +1,6 @@
 import time
 import datetime as dt
-from typing import Any, Optional
+from typing import Any, Final, Optional
 
 import pandas as pd
 import requests
@@ -25,13 +25,15 @@ from dagster_loaders.resources import PostgresResource
 from dagster_loaders.defs.data_quality import provider_market_data_quality
 from dagster_loaders.defs.provider_assets import provider_asset_map
 
-COINBASE_POOL = "coinbase-api"
-COINBASE_RATE_LIMIT_SECONDS = 0.4
-BATCH_SIZE = 5000
-LOOKBACK_MINUTES = 60
-GRANULARITY_SECONDS = 60
-PRODUCTS_URL = "https://api.exchange.coinbase.com/products"
-CANDLES_URL_TEMPLATE = "https://api.exchange.coinbase.com/products/{product_id}/candles"
+COINBASE_POOL: Final[str] = "coinbase-api"
+COINBASE_RATE_LIMIT_SECONDS: Final[float] = 0.4
+BATCH_SIZE: int = 5000
+LOOKBACK_MINUTES: Final[int] = 60
+GRANULARITY_SECONDS: Final[int] = 60
+PRODUCTS_URL: Final[str] = "https://api.exchange.coinbase.com/products"
+CANDLES_URL_TEMPLATE: Final[str] = (
+    "https://api.exchange.coinbase.com/products/{product_id}/candles"
+)
 
 
 def _request_coinbase(url: str, params: Optional[dict[str, Any]] = None) -> Any:

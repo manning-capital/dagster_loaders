@@ -8,6 +8,11 @@ from mc_postgres_db.models import Asset, Provider, ProviderAsset
 def provider_asset_map(
     engine: Engine, provider_name: str, as_of: dt.date
 ) -> tuple[int, dict[str, int]]:
+    """Return `(provider_id, {asset_code: asset_id})` for a given provider.
+
+    Picks the latest active `provider_asset` row per `(asset_code, provider_id)`
+    on or before `as_of`, and only includes assets that are themselves active.
+    """
     with Session(engine) as session:
         provider_id = session.execute(
             select(Provider.id).where(Provider.name == provider_name)

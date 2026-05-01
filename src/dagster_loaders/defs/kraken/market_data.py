@@ -1,6 +1,6 @@
 import time
 import datetime as dt
-from typing import Any, Optional
+from typing import Any, Final, Optional
 
 import pandas as pd
 import requests
@@ -25,11 +25,11 @@ from dagster_loaders.resources import PostgresResource
 from dagster_loaders.defs.data_quality import provider_market_data_quality
 from dagster_loaders.defs.provider_assets import provider_asset_map
 
-KRAKEN_POOL = "kraken-api"
-KRAKEN_RATE_LIMIT_SECONDS = 1.0
-BATCH_SIZE = 5000
-ASSET_PAIRS_URL = "https://api.kraken.com/0/public/AssetPairs"
-OHLC_URL = "https://api.kraken.com/0/public/OHLC"
+KRAKEN_POOL: Final[str] = "kraken-api"
+KRAKEN_RATE_LIMIT_SECONDS: Final[float] = 1.0
+BATCH_SIZE: int = 5000
+ASSET_PAIRS_URL: Final[str] = "https://api.kraken.com/0/public/AssetPairs"
+OHLC_URL: Final[str] = "https://api.kraken.com/0/public/OHLC"
 
 
 def _request_kraken(

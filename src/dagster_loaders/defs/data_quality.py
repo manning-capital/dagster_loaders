@@ -1,15 +1,25 @@
 import datetime as dt
-from typing import Any
+from typing import Final, TypedDict
 
 from dagster import MetadataValue, AssetCheckResult, AssetCheckSeverity
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 from mc_postgres_db.models import Provider, ProviderAssetMarket
 
-RECENT_WINDOW_HOURS = 2
-BASELINE_DAYS = 30
-MIN_HISTORY_DAYS = 3
-DROP_RATIO = 0.5
+RECENT_WINDOW_HOURS: Final[int] = 2
+BASELINE_DAYS: Final[int] = 30
+MIN_HISTORY_DAYS: Final[int] = 3
+DROP_RATIO: Final[float] = 0.5
+
+
+class LowDensityPair(TypedDict):
+    from_asset_id: int
+    to_asset_id: int
+    provider_id: int
+    recent_count: int
+    recent_per_hour: float
+    baseline_per_hour: float
+    ratio: float
 
 
 def provider_market_data_quality(
@@ -97,10 +107,10 @@ def provider_market_data_quality(
     }
     historical_by_pair = {(h.from_asset_id, h.to_asset_id): h for h in historical_stats}
 
-    low_density_pairs: list[dict[str, Any]] = []
-    skipped_new_pairs = 0
+    low_density_pairs: list[LowDensityPair] = []
+    skipped_new_pairs: int = 0
 
-    historical_window_hours_max = BASELINE_DAYS * 24 - RECENT_WINDOW_HOURS
+    historical_window_hours_max: int = BASELINE_DAYS * 24 - RECENT_WINDOW_HOURS
 
     for key, hist in historical_by_pair.items():
         from_asset_id, to_asset_id = key
@@ -131,15 +141,15 @@ def provider_market_data_quality(
 
         if recent_per_hour < baseline_per_hour * DROP_RATIO:
             low_density_pairs.append(
-                {
-                    "from_asset_id": from_asset_id,
-                    "to_asset_id": to_asset_id,
-                    "provider_id": provider_id,
-                    "recent_count": recent_count,
-                    "recent_per_hour": round(recent_per_hour, 3),
-                    "baseline_per_hour": round(baseline_per_hour, 3),
-                    "ratio": round(recent_per_hour / baseline_per_hour, 3),
-                }
+                LowDensityPair(
+                    from_asset_id=from_asset_id,
+                    to_asset_id=to_asset_id,
+                    provider_id=provider_id,
+                    recent_count=recent_count,
+                    recent_per_hour=round(recent_per_hour, 3),
+                    baseline_per_hour=round(baseline_per_hour, 3),
+                    ratio=round(recent_per_hour / baseline_per_hour, 3),
+                )
             )
 
     failures: list[str] = []
