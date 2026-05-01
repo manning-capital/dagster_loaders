@@ -10,10 +10,10 @@ from sqlalchemy.orm import Session
 
 from dagster_loaders.defs import kraken_market_data
 from dagster_loaders.defs.kraken_market_data import (
-    PostgresResource,
     kraken_market_data_quality,
     kraken_provider_asset_market,
 )
+from dagster_loaders.resources import PostgresResource
 
 
 def _stub_kraken(

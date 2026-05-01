@@ -13,9 +13,11 @@ from mc_postgres_db.models import (
     Asset,
     AssetType,
     Base,
+    ContentType,
     Provider,
     ProviderAsset,
     ProviderType,
+    SentimentType,
 )
 from mc_postgres_db.testing.utilities import (
     TEST_DB_NAME,
@@ -191,4 +193,42 @@ def kraken_base_data(postgres_engine: Engine) -> dict[str, Any]:
             "one_inch_asset_id": session.execute(
                 select(Asset.id).where(Asset.name == "1INCH")
             ).scalar_one(),
+        }
+
+
+@pytest.fixture
+def coindesk_base_data(postgres_engine: Engine) -> dict[str, int]:
+    """Seed the COINDESK parent provider, NEWS_PROVIDER type, NEWS content type,
+    and NLTKVader sentiment type. Returns a dict of ids."""
+    with Session(postgres_engine) as session:
+        news_provider_type = ProviderType(
+            name="NEWS_PROVIDER", description="news provider"
+        )
+        session.add(news_provider_type)
+        session.commit()
+
+        coindesk = Provider(
+            name="Coindesk",
+            description="Coindesk",
+            provider_external_code="COINDESK",
+            provider_type_id=news_provider_type.id,
+        )
+        session.add(coindesk)
+        session.commit()
+
+        news_content_type = ContentType(name="NEWS", description="news article")
+        session.add(news_content_type)
+        session.commit()
+
+        nltk_vader = SentimentType(
+            name="NLTKVader", description="NLTK VADER compound sentiment"
+        )
+        session.add(nltk_vader)
+        session.commit()
+
+        return {
+            "coindesk_provider_id": coindesk.id,
+            "news_provider_type_id": news_provider_type.id,
+            "news_content_type_id": news_content_type.id,
+            "nltk_vader_sentiment_type_id": nltk_vader.id,
         }
