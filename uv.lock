@@ -631,6 +631,7 @@ dev = [
     { name = "docker" },
     { name = "pytest" },
     { name = "responses" },
+    { name = "ruff" },
 ]
 
 [package.metadata]
@@ -652,6 +653,7 @@ dev = [
     { name = "docker", specifier = ">=7.0.0" },
     { name = "pytest", specifier = ">=8.4.0" },
     { name = "responses", specifier = ">=0.25.0" },
+    { name = "ruff", specifier = ">=0.11.13" },
 ]
 
 [[package]]

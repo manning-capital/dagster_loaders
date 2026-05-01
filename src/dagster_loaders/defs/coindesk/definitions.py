@@ -1,6 +1,6 @@
 from dagster import (
-    AssetSelection,
     Definitions,
+    AssetSelection,
     ScheduleDefinition,
     define_asset_job,
 )
@@ -8,7 +8,6 @@ from dagster import (
 from dagster_loaders.defs.coindesk.content import coindesk_news_content
 from dagster_loaders.defs.coindesk.providers import coindesk_news_providers
 from dagster_loaders.defs.coindesk.sentiment import coindesk_content_sentiment
-
 
 coindesk_content_job = define_asset_job(
     name="coindesk_content_job",

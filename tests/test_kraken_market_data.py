@@ -4,16 +4,16 @@ from typing import Any
 import pytest
 import responses
 from dagster import AssetSelection, materialize
-from mc_postgres_db.models import ProviderAssetMarket
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
+from mc_postgres_db.models import ProviderAssetMarket
 
 from dagster_loaders.defs import kraken_market_data
+from dagster_loaders.resources import PostgresResource
 from dagster_loaders.defs.kraken_market_data import (
     kraken_market_data_quality,
     kraken_provider_asset_market,
 )
-from dagster_loaders.resources import PostgresResource
 
 
 def _stub_kraken(

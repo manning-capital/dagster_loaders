@@ -3,33 +3,33 @@ import datetime as dt
 import nltk
 import pandas as pd
 from dagster import (
+    Definitions,
+    MetadataValue,
     AssetCheckResult,
+    MaterializeResult,
     AssetCheckSeverity,
     AssetExecutionContext,
-    Definitions,
-    MaterializeResult,
-    MetadataValue,
     asset,
     asset_check,
 )
+from sqlalchemy import or_, func, select
+from sqlalchemy.orm import Session
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from mc_postgres_db.models import (
     ContentType,
+    SentimentType,
     ProviderContent,
     ProviderContentSentiment,
-    SentimentType,
 )
 from mc_postgres_db.operations import set_data
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
-from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
 
+from dagster_loaders.resources import PostgresResource
 from dagster_loaders.defs.coindesk.common import (
-    COINDESK_SENTIMENT_POOL,
-    FRESHNESS,
     RETRY,
+    FRESHNESS,
+    COINDESK_SENTIMENT_POOL,
 )
 from dagster_loaders.defs.coindesk.content import coindesk_news_content
-from dagster_loaders.resources import PostgresResource
 
 
 @asset(
@@ -92,10 +92,20 @@ def coindesk_content_sentiment(
             f"{today.isoformat()}"
         )
 
+        empty_mask = unprocessed["content"].fillna("").astype(str).str.strip() == ""
+        skipped_empty = int(empty_mask.sum())
+        if skipped_empty:
+            context.log.warning(
+                f"Skipping {skipped_empty} content rows with null/empty body "
+                f"(VADER can't score them)"
+            )
+            unprocessed = unprocessed[~empty_mask].copy()
+
         if unprocessed.empty:
             return MaterializeResult(
                 metadata={
                     "row_count": 0,
+                    "skipped_empty": skipped_empty,
                     "table": ProviderContentSentiment.__tablename__,
                     "as_of": MetadataValue.text(today.isoformat()),
                 }
@@ -119,6 +129,7 @@ def coindesk_content_sentiment(
         return MaterializeResult(
             metadata={
                 "row_count": len(scored),
+                "skipped_empty": skipped_empty,
                 "mean_compound": float(scored["sentiment_score"].mean()),
                 "table": ProviderContentSentiment.__tablename__,
                 "as_of": MetadataValue.text(today.isoformat()),
@@ -146,8 +157,9 @@ def coindesk_content_sentiment(
     name="coindesk_content_sentiment_quality",
     description=(
         "Today's NLTK VADER sentiment rows have compound scores in [-1, 1], "
-        "components in [0, 1], components summing to ~1.0, and every NEWS "
-        "content row from today has a corresponding sentiment row."
+        "components in [0, 1], no all-zero rows (VADER no-signal), "
+        "components summing to ~1.0, and every NEWS content row from today "
+        "has a corresponding sentiment row."
     ),
     blocking=False,
 )
@@ -209,6 +221,7 @@ def coindesk_content_sentiment_quality(
 
     out_of_range_compound = 0
     out_of_range_components = 0
+    all_zero = 0
     sum_off = 0
     if not score_rows.empty:
         compound = score_rows["sentiment_score"]
@@ -220,18 +233,26 @@ def coindesk_content_sentiment_quality(
         ):
             col = score_rows[c]
             out_of_range_components += int(((col < 0.0) | (col > 1.0)).sum())
-        component_sum = (
-            score_rows["positive_sentiment_score"]
-            + score_rows["negative_sentiment_score"]
-            + score_rows["neutral_sentiment_score"]
-        )
-        sum_off = int(((component_sum - 1.0).abs() > 0.01).sum())
+        pos = score_rows["positive_sentiment_score"]
+        neg = score_rows["negative_sentiment_score"]
+        neu = score_rows["neutral_sentiment_score"]
+        all_zero_mask = (pos == 0.0) & (neg == 0.0) & (neu == 0.0)
+        all_zero = int(all_zero_mask.sum())
+        component_sum = pos + neg + neu
+        # Sum-off counts rows that aren't all-zero but still don't sum to ~1,
+        # so the two categories don't double-count.
+        sum_off = int((((component_sum - 1.0).abs() > 0.01) & (~all_zero_mask)).sum())
 
     failures: list[str] = []
     if out_of_range_compound:
         failures.append(f"{out_of_range_compound} compound scores outside [-1, 1]")
     if out_of_range_components:
         failures.append(f"{out_of_range_components} component scores outside [0, 1]")
+    if all_zero:
+        failures.append(
+            f"{all_zero} all-zero rows (VADER no-signal — clean up legacy or wait "
+            f"for them to age out)"
+        )
     if sum_off:
         failures.append(f"{sum_off} rows where pos+neg+neu deviates from 1.0 by >0.01")
     if uncovered:
@@ -247,6 +268,7 @@ def coindesk_content_sentiment_quality(
             "rows_today": len(score_rows),
             "out_of_range_compound": out_of_range_compound,
             "out_of_range_components": out_of_range_components,
+            "all_zero_rows": all_zero,
             "sum_off_by_001": sum_off,
             "uncovered_news_today": int(uncovered),
             "as_of": MetadataValue.text(today.isoformat()),

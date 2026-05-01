@@ -1,31 +1,30 @@
-import datetime as dt
 import time
+import datetime as dt
 from typing import Any, Optional
 
 import pandas as pd
 import requests
 from dagster import (
-    AssetCheckResult,
-    AssetCheckSeverity,
-    AssetExecutionContext,
     Backoff,
     Definitions,
-    FreshnessPolicy,
-    MaterializeResult,
-    MetadataValue,
     RetryPolicy,
+    MetadataValue,
+    FreshnessPolicy,
+    AssetCheckResult,
+    MaterializeResult,
+    AssetCheckSeverity,
     ScheduleDefinition,
+    AssetExecutionContext,
     asset,
     asset_check,
     define_asset_job,
 )
-from mc_postgres_db.models import Asset, Provider, ProviderAsset, ProviderAssetMarket
-from mc_postgres_db.operations import set_data
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
+from mc_postgres_db.models import Asset, Provider, ProviderAsset, ProviderAssetMarket
+from mc_postgres_db.operations import set_data
 
 from dagster_loaders.resources import PostgresResource
-
 
 KRAKEN_POOL = "kraken-api"
 KRAKEN_RATE_LIMIT_SECONDS = 1.0

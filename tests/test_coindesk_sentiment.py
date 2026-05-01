@@ -1,19 +1,19 @@
 import datetime as dt
 
 from dagster import AssetSelection, materialize
+from sqlalchemy import Engine, select
+from sqlalchemy.orm import Session
 from mc_postgres_db.models import (
     Provider,
     ProviderContent,
     ProviderContentSentiment,
 )
-from sqlalchemy import Engine, select
-from sqlalchemy.orm import Session
 
+from dagster_loaders.resources import PostgresResource
 from dagster_loaders.defs.coindesk.sentiment import (
     coindesk_content_sentiment,
     coindesk_content_sentiment_quality,
 )
-from dagster_loaders.resources import PostgresResource
 
 
 def _seed_content_provider(engine: Engine, coindesk_base_data: dict[str, int]) -> int:
@@ -236,6 +236,91 @@ def test_quality_check_fails_on_uncovered_today_content(
     assert evals[0].passed is False
     assert "without a NLTKVader sentiment" in (evals[0].description or "")
     assert evals[0].metadata["uncovered_news_today"].value == 1
+
+
+def test_skips_content_with_empty_body(
+    postgres_engine: Engine, coindesk_base_data: dict[str, int]
+) -> None:
+    provider_id = _seed_content_provider(postgres_engine, coindesk_base_data)
+    _seed_news_content(
+        postgres_engine,
+        coindesk_base_data,
+        provider_id=provider_id,
+        items=[("c-empty", ""), ("c-whitespace", "   \n  ")],
+    )
+
+    result = _materialize(postgres_engine)
+    assert result.success
+
+    with Session(postgres_engine) as session:
+        rows = session.execute(select(ProviderContentSentiment)).scalars().all()
+        assert rows == []
+
+
+def test_quality_check_fails_on_legacy_all_zero_rows(
+    postgres_engine: Engine, coindesk_base_data: dict[str, int]
+) -> None:
+    """All-zero sentiment rows (legacy data from empty-content scoring) should
+    fail the check until they age out of the today window or get cleaned up
+    manually. The asset itself no longer produces them."""
+    provider_id = _seed_content_provider(postgres_engine, coindesk_base_data)
+    content_ids = _seed_news_content(
+        postgres_engine,
+        coindesk_base_data,
+        provider_id=provider_id,
+        items=[("c1", "real content for scoring")],
+    )
+    with Session(postgres_engine) as session:
+        session.add(
+            ProviderContentSentiment(
+                provider_content_id=content_ids[0],
+                sentiment_type_id=coindesk_base_data["nltk_vader_sentiment_type_id"],
+                sentiment_score=0.0,
+                positive_sentiment_score=0.0,
+                negative_sentiment_score=0.0,
+                neutral_sentiment_score=0.0,
+            )
+        )
+        session.commit()
+
+    result = _run_check_only(postgres_engine)
+    evals = result.get_asset_check_evaluations()
+    assert evals[0].passed is False
+    assert "all-zero rows" in (evals[0].description or "")
+    assert evals[0].metadata["all_zero_rows"].value == 1
+    # All-zero rows are reported separately and don't double-count toward sum_off
+    assert evals[0].metadata["sum_off_by_001"].value == 0
+
+
+def test_quality_check_fails_on_genuinely_off_sum(
+    postgres_engine: Engine, coindesk_base_data: dict[str, int]
+) -> None:
+    provider_id = _seed_content_provider(postgres_engine, coindesk_base_data)
+    content_ids = _seed_news_content(
+        postgres_engine,
+        coindesk_base_data,
+        provider_id=provider_id,
+        items=[("c1", "anything")],
+    )
+    with Session(postgres_engine) as session:
+        # Components sum to 0.5 (not zero, not one) — genuine bug indicator
+        session.add(
+            ProviderContentSentiment(
+                provider_content_id=content_ids[0],
+                sentiment_type_id=coindesk_base_data["nltk_vader_sentiment_type_id"],
+                sentiment_score=0.0,
+                positive_sentiment_score=0.2,
+                negative_sentiment_score=0.1,
+                neutral_sentiment_score=0.2,
+            )
+        )
+        session.commit()
+
+    result = _run_check_only(postgres_engine)
+    evals = result.get_asset_check_evaluations()
+    assert evals[0].passed is False
+    assert "deviates from 1.0" in (evals[0].description or "")
+    assert evals[0].metadata["sum_off_by_001"].value == 1
 
 
 def test_quality_check_fails_on_out_of_range_score(
