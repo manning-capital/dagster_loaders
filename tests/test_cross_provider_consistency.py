@@ -189,14 +189,14 @@ def test_wrapped_assets_do_not_collapse_to_underlying(
     coinbase_base_data: dict[str, Any],
     kraken_base_data: dict[str, Any],
 ) -> None:
-    """WBTC has BTC as underlying, but BTC is CryptoCurrency (not FiatCurrency)
+    """WBTC has BTC as underlying, but BTC is DIGITAL_CURRENCY (not FIAT_CURRENCY)
     so collapse must NOT happen. Coinbase WBTC-USD and Kraken BTC-USD stay as
     two separate (to_asset) groups, each with one provider -> both skipped.
     """
     ts = _window_end()
     with Session(postgres_engine) as session:
         crypto_type = session.execute(
-            select(AssetType).where(AssetType.name == "CryptoCurrency")
+            select(AssetType).where(AssetType.name == "DIGITAL_CURRENCY")
         ).scalar_one()
         wbtc = Asset(
             name="WBTC",

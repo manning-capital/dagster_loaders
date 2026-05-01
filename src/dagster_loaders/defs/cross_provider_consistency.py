@@ -3,11 +3,13 @@ from collections.abc import Iterable
 
 from dagster import (
     Definitions,
+    AssetCheckKey,
     AssetCheckSpec,
     AssetSelection,
     AssetCheckResult,
     ScheduleDefinition,
     DefaultScheduleStatus,
+    AssetCheckExecutionContext,
     define_asset_job,
     multi_asset_check,
 )
@@ -46,16 +48,25 @@ CHECK_DESCRIPTION: Final[str] = (
         )
         for a in UPSTREAM_ASSETS
     ],
+    can_subset=True,
 )
 def cross_provider_consistency(
+    context: AssetCheckExecutionContext,
     postgres: PostgresResource,
 ) -> Iterable[AssetCheckResult]:
+    # Subsetting is required because each per-provider job (e.g. coinbase_market_job)
+    # selects only one of these specs' check keys; without can_subset, Dagster fails
+    # to build those jobs at definition load time.
+    selected = context.selected_asset_check_keys
     engine = postgres.get_engine()
     try:
         result = cross_provider_consistency_check(engine)
     finally:
         engine.dispose()
     for a in UPSTREAM_ASSETS:
+        key = AssetCheckKey(asset_key=a.key, name=CHECK_NAME)
+        if key not in selected:
+            continue
         yield AssetCheckResult(
             check_name=CHECK_NAME,
             asset_key=a.key,

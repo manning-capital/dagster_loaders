@@ -137,10 +137,12 @@ def kraken_base_data(postgres_engine: Engine) -> dict[str, Any]:
         session.commit()
 
         crypto_type = session.execute(
-            select(AssetType).where(AssetType.name == "CryptoCurrency")
+            select(AssetType).where(AssetType.name == "DIGITAL_CURRENCY")
         ).scalar_one_or_none()
         if crypto_type is None:
-            crypto_type = AssetType(name="CryptoCurrency", description="CryptoCurrency")
+            crypto_type = AssetType(
+                name="DIGITAL_CURRENCY", description="DIGITAL_CURRENCY"
+            )
             session.add(crypto_type)
             session.commit()
 
@@ -270,10 +272,12 @@ def coinbase_base_data(postgres_engine: Engine) -> dict[str, Any]:
         session.commit()
 
         crypto_type = session.execute(
-            select(AssetType).where(AssetType.name == "CryptoCurrency")
+            select(AssetType).where(AssetType.name == "DIGITAL_CURRENCY")
         ).scalar_one_or_none()
         if crypto_type is None:
-            crypto_type = AssetType(name="CryptoCurrency", description="CryptoCurrency")
+            crypto_type = AssetType(
+                name="DIGITAL_CURRENCY", description="DIGITAL_CURRENCY"
+            )
             session.add(crypto_type)
             session.commit()
 
@@ -357,7 +361,7 @@ def okx_base_data(postgres_engine: Engine) -> dict[str, Any]:
     """Seed the OKX provider plus three assets and provider-asset mappings.
 
     OKX trades primarily USDT pairs (almost no USD spot), so the third asset
-    is USDT (CryptoCurrency) rather than USD (FiatCurrency).
+    is USDT (DIGITAL_CURRENCY) rather than USD (FIAT_CURRENCY).
 
     Uses defensive lookups for ProviderType/AssetType/Asset rows so this
     fixture can coexist with `coinbase_base_data` / `kraken_base_data` in the
@@ -384,10 +388,12 @@ def okx_base_data(postgres_engine: Engine) -> dict[str, Any]:
         session.commit()
 
         crypto_type = session.execute(
-            select(AssetType).where(AssetType.name == "CryptoCurrency")
+            select(AssetType).where(AssetType.name == "DIGITAL_CURRENCY")
         ).scalar_one_or_none()
         if crypto_type is None:
-            crypto_type = AssetType(name="CryptoCurrency", description="CryptoCurrency")
+            crypto_type = AssetType(
+                name="DIGITAL_CURRENCY", description="DIGITAL_CURRENCY"
+            )
             session.add(crypto_type)
             session.commit()
 
