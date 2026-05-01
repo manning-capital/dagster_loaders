@@ -1,7 +1,15 @@
 import datetime as dt
+import statistics
 from typing import Final, TypedDict
 
-from dagster import MetadataValue, AssetCheckResult, AssetCheckSeverity
+from dagster import (
+    TableColumn,
+    TableRecord,
+    TableSchema,
+    MetadataValue,
+    AssetCheckResult,
+    AssetCheckSeverity,
+)
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 from mc_postgres_db.models import Provider, ProviderAssetMarket
@@ -20,6 +28,27 @@ class LowDensityPair(TypedDict):
     recent_per_hour: float
     baseline_per_hour: float
     ratio: float
+
+
+_LOW_DENSITY_TABLE_SCHEMA: Final[TableSchema] = TableSchema(
+    columns=[
+        TableColumn(name="from_asset_id", type="int"),
+        TableColumn(name="to_asset_id", type="int"),
+        TableColumn(name="provider_id", type="int"),
+        TableColumn(name="recent_count", type="int"),
+        TableColumn(name="recent_per_hour", type="float"),
+        TableColumn(name="baseline_per_hour", type="float"),
+        TableColumn(
+            name="ratio",
+            type="float",
+            description="recent_per_hour / baseline_per_hour",
+        ),
+    ]
+)
+
+
+def _low_density_pairs_table(pairs: list[LowDensityPair]) -> list[TableRecord]:
+    return [TableRecord(dict(p)) for p in sorted(pairs, key=lambda p: p["ratio"])]
 
 
 def provider_market_data_quality(
@@ -108,7 +137,9 @@ def provider_market_data_quality(
     historical_by_pair = {(h.from_asset_id, h.to_asset_id): h for h in historical_stats}
 
     low_density_pairs: list[LowDensityPair] = []
+    pair_ratios: list[float] = []
     skipped_new_pairs: int = 0
+    skipped_sparse_pairs: int = 0
 
     historical_window_hours_max: int = BASELINE_DAYS * 24 - RECENT_WINDOW_HOURS
 
@@ -134,10 +165,13 @@ def provider_market_data_quality(
         # the ratio test isn't statistically meaningful at that density and
         # would routinely false-positive on naturally sparse pairs.
         if expected_recent < 1:
+            skipped_sparse_pairs += 1
             continue
 
         recent_count = recent_by_pair.get(key, 0)
         recent_per_hour = recent_count / RECENT_WINDOW_HOURS
+        ratio = recent_per_hour / baseline_per_hour
+        pair_ratios.append(ratio)
 
         if recent_per_hour < baseline_per_hour * DROP_RATIO:
             low_density_pairs.append(
@@ -148,9 +182,18 @@ def provider_market_data_quality(
                     recent_count=recent_count,
                     recent_per_hour=round(recent_per_hour, 3),
                     baseline_per_hour=round(baseline_per_hour, 3),
-                    ratio=round(recent_per_hour / baseline_per_hour, 3),
+                    ratio=round(ratio, 3),
                 )
             )
+
+    pairs_evaluated: int = len(pair_ratios)
+    mean_ratio: float = statistics.fmean(pair_ratios) if pair_ratios else 0.0
+    median_ratio: float = statistics.median(pair_ratios) if pair_ratios else 0.0
+    min_ratio: float = min(pair_ratios) if pair_ratios else 0.0
+    max_ratio: float = max(pair_ratios) if pair_ratios else 0.0
+    pairs_below_75pct: int = sum(1 for r in pair_ratios if r < 0.75)
+    pairs_below_50pct: int = sum(1 for r in pair_ratios if r < 0.50)
+    pairs_below_25pct: int = sum(1 for r in pair_ratios if r < 0.25)
 
     failures: list[str] = []
     if recent_rows == 0:
@@ -176,7 +219,19 @@ def provider_market_data_quality(
             "min_close_price": MetadataValue.float(float(min_close or 0.0)),
             "off_minute_rows": off_minute_rows,
             "low_density_pairs_count": len(low_density_pairs),
-            "low_density_pairs": MetadataValue.json(low_density_pairs),
+            "low_density_pairs": MetadataValue.table(
+                records=_low_density_pairs_table(low_density_pairs),
+                schema=_LOW_DENSITY_TABLE_SCHEMA,
+            ),
             "skipped_new_pairs": skipped_new_pairs,
+            "skipped_sparse_pairs": skipped_sparse_pairs,
+            "pairs_evaluated": pairs_evaluated,
+            "mean_density_ratio": MetadataValue.float(round(mean_ratio, 4)),
+            "median_density_ratio": MetadataValue.float(round(median_ratio, 4)),
+            "min_density_ratio": MetadataValue.float(round(min_ratio, 4)),
+            "max_density_ratio": MetadataValue.float(round(max_ratio, 4)),
+            "pairs_below_75pct": pairs_below_75pct,
+            "pairs_below_50pct": pairs_below_50pct,
+            "pairs_below_25pct": pairs_below_25pct,
         },
     )

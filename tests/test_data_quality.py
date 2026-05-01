@@ -108,12 +108,14 @@ def test_flags_density_drop_to_zero(
         timestamps=baseline,
     )
     result = provider_market_data_quality(postgres_engine, "Kraken")
-    flagged = result.metadata["low_density_pairs"].value
     assert result.metadata["low_density_pairs_count"].value == 1
-    assert flagged[0]["from_asset_id"] == from_id
-    assert flagged[0]["to_asset_id"] == to_id
-    assert flagged[0]["recent_count"] == 0
-    assert flagged[0]["ratio"] == 0
+    table = result.metadata["low_density_pairs"].value
+    assert len(table.records) == 1
+    record = table.records[0].data
+    assert record["from_asset_id"] == from_id
+    assert record["to_asset_id"] == to_id
+    assert record["recent_count"] == 0
+    assert record["ratio"] == 0
 
 
 def test_flags_density_dropped_below_half(
@@ -138,10 +140,14 @@ def test_flags_density_dropped_below_half(
     )
     result = provider_market_data_quality(postgres_engine, "Kraken")
     assert result.metadata["low_density_pairs_count"].value == 1
-    flagged = result.metadata["low_density_pairs"].value[0]
-    assert flagged["recent_count"] == 1
+    record = result.metadata["low_density_pairs"].value.records[0].data
+    assert record["from_asset_id"] == from_id
+    assert record["to_asset_id"] == to_id
+    assert record["recent_count"] == 1
     # ratio is recent_per_hour (0.5) / baseline_per_hour (~4.0) ≈ 0.125
-    assert flagged["ratio"] < 0.5
+    assert record["ratio"] < 0.5
+    # And the min_density_ratio aggregate should reflect the drop.
+    assert result.metadata["min_density_ratio"].value < 0.5
 
 
 def test_passes_when_density_only_dipped_slightly(
@@ -355,23 +361,173 @@ def test_skipped_new_pairs_metric_counts_correctly(
     assert result.metadata["skipped_new_pairs"].value == 2
 
 
-def test_returns_provider_id_in_flagged_pair(
+def test_low_density_pairs_table_empty_when_nothing_flagged(
     postgres_engine: Engine, kraken_base_data: dict[str, Any]
 ) -> None:
-    """Flagged pairs include their provider_id so downstream alerts can route correctly."""
+    """When nothing is flagged, the table is empty (zero records) but the schema is still present."""
     now = _now()
     provider_id, from_id, to_id = _ids(kraken_base_data)
-    baseline = [now - dt.timedelta(hours=h) for h in range(2, 5 * 24)]
+    # 5d at 1/hour baseline + matching recent → no flags.
     _seed(
         postgres_engine,
         provider_id=provider_id,
         from_asset_id=from_id,
         to_asset_id=to_id,
-        timestamps=baseline,
+        timestamps=[
+            *(now - dt.timedelta(hours=h) for h in range(2, 5 * 24)),
+            now - dt.timedelta(minutes=30),
+            now - dt.timedelta(minutes=90),
+        ],
     )
     result = provider_market_data_quality(postgres_engine, "Kraken")
-    flagged = result.metadata["low_density_pairs"].value[0]
-    assert flagged["provider_id"] == provider_id
+    assert result.metadata["low_density_pairs_count"].value == 0
+    table = result.metadata["low_density_pairs"].value
+    assert table.records == []
+    schema_columns = {c.name for c in table.schema.columns}
+    assert {"from_asset_id", "to_asset_id", "ratio"}.issubset(schema_columns)
+
+
+def test_aggregate_density_metrics_empty_table(
+    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+) -> None:
+    """When there are no evaluated pairs, aggregate metrics are 0 sentinels (plottable)."""
+    result = provider_market_data_quality(postgres_engine, "Kraken")
+    md = result.metadata
+    assert md["pairs_evaluated"].value == 0
+    assert md["mean_density_ratio"].value == 0.0
+    assert md["median_density_ratio"].value == 0.0
+    assert md["min_density_ratio"].value == 0.0
+    assert md["max_density_ratio"].value == 0.0
+    assert md["pairs_below_75pct"].value == 0
+    assert md["pairs_below_50pct"].value == 0
+    assert md["pairs_below_25pct"].value == 0
+
+
+def test_aggregate_density_metrics_stable_pair(
+    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+) -> None:
+    """One pair at stable ~1.0 density: mean/median/min/max all near 1, no buckets fire."""
+    now = _now()
+    provider_id, from_id, to_id = _ids(kraken_base_data)
+    baseline = [now - dt.timedelta(hours=h) for h in range(2, 5 * 24)]
+    recent = [now - dt.timedelta(minutes=30), now - dt.timedelta(minutes=90)]
+    _seed(
+        postgres_engine,
+        provider_id=provider_id,
+        from_asset_id=from_id,
+        to_asset_id=to_id,
+        timestamps=baseline + recent,
+    )
+    md = provider_market_data_quality(postgres_engine, "Kraken").metadata
+    assert md["pairs_evaluated"].value == 1
+    # ratio = 1.0 / (118/118) = ~1.0 (recent 2 rows in 2h vs ~1 row/hr baseline)
+    assert 0.9 < md["mean_density_ratio"].value < 1.1
+    assert md["pairs_below_75pct"].value == 0
+    assert md["pairs_below_50pct"].value == 0
+    assert md["pairs_below_25pct"].value == 0
+
+
+def test_aggregate_density_metrics_severity_buckets(
+    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+) -> None:
+    """Three pairs at ratios ~1.0, ~0.33, ~0.0 → severity buckets fire correctly."""
+    now = _now()
+    provider_id = kraken_base_data["provider_id"]
+    btc = kraken_base_data["btc_asset_id"]
+    eth = kraken_base_data["eth_asset_id"]
+    one_inch = kraken_base_data["one_inch_asset_id"]
+    usd = kraken_base_data["usd_asset_id"]
+
+    # Baseline: 3 rows per hour for 5 days at minutes 0/20/40, so the recent-row
+    # offsets below avoid PK collisions and ratios land cleanly off bucket edges.
+    baseline_pairs = [(usd, btc), (usd, eth), (usd, one_inch)]
+    for from_id, to_id in baseline_pairs:
+        rows = []
+        for h in range(2, 5 * 24):
+            for m in (0, 20, 40):
+                rows.append(now - dt.timedelta(hours=h, minutes=m))
+        _seed(
+            postgres_engine,
+            provider_id=provider_id,
+            from_asset_id=from_id,
+            to_asset_id=to_id,
+            timestamps=rows,
+        )
+
+    # Recent (offset 5 min from baseline grid):
+    #   BTC: 6 rows in 2h → recent_per_hour=3, ratio=1.0
+    #   ETH: 2 rows in 2h → recent_per_hour=1, ratio≈0.333
+    #   1INCH: 0 rows → ratio 0.0
+    _seed(
+        postgres_engine,
+        provider_id=provider_id,
+        from_asset_id=usd,
+        to_asset_id=btc,
+        timestamps=[now - dt.timedelta(minutes=20 * i + 5) for i in range(6)],
+    )
+    _seed(
+        postgres_engine,
+        provider_id=provider_id,
+        from_asset_id=usd,
+        to_asset_id=eth,
+        timestamps=[
+            now - dt.timedelta(minutes=10),
+            now - dt.timedelta(minutes=70),
+        ],
+    )
+
+    md = provider_market_data_quality(postgres_engine, "Kraken").metadata
+    assert md["pairs_evaluated"].value == 3
+    assert md["max_density_ratio"].value > 0.9
+    assert md["min_density_ratio"].value == 0.0
+    # mean ≈ (1.0 + 0.333 + 0.0) / 3 ≈ 0.444
+    assert 0.4 < md["mean_density_ratio"].value < 0.5
+    # median is the middle value ≈ 0.333
+    assert 0.3 < md["median_density_ratio"].value < 0.4
+    # ETH (~0.333) and 1INCH (0.0) both below 75% → 2
+    assert md["pairs_below_75pct"].value == 2
+    # ETH (~0.333) and 1INCH (0.0) both below 50% → 2
+    assert md["pairs_below_50pct"].value == 2
+    # 1INCH (0.0) below 25%, ETH (~0.333) is not → 1
+    assert md["pairs_below_25pct"].value == 1
+
+
+def test_aggregate_density_metrics_skipped_pairs_not_counted(
+    postgres_engine: Engine, kraken_base_data: dict[str, Any]
+) -> None:
+    """Pairs skipped (new or sparse) don't contribute to the ratio aggregates."""
+    now = _now()
+    provider_id = kraken_base_data["provider_id"]
+    btc = kraken_base_data["btc_asset_id"]
+    eth = kraken_base_data["eth_asset_id"]
+    usd = kraken_base_data["usd_asset_id"]
+
+    # Mature pair at stable density.
+    _seed(
+        postgres_engine,
+        provider_id=provider_id,
+        from_asset_id=usd,
+        to_asset_id=btc,
+        timestamps=[
+            *(now - dt.timedelta(hours=h) for h in range(2, 5 * 24)),
+            now - dt.timedelta(minutes=30),
+            now - dt.timedelta(minutes=90),
+        ],
+    )
+    # New pair (< 3d history).
+    _seed(
+        postgres_engine,
+        provider_id=provider_id,
+        from_asset_id=usd,
+        to_asset_id=eth,
+        timestamps=[now - dt.timedelta(hours=h) for h in range(2, 24)],
+    )
+
+    md = provider_market_data_quality(postgres_engine, "Kraken").metadata
+    assert md["pairs_evaluated"].value == 1
+    assert md["skipped_new_pairs"].value == 1
+    # Mean only reflects the mature pair.
+    assert 0.9 < md["mean_density_ratio"].value < 1.1
 
 
 def test_does_not_create_phantom_rows(
