@@ -12,11 +12,9 @@ from dagster import (
     FreshnessPolicy,
     AssetCheckResult,
     MaterializeResult,
-    ScheduleDefinition,
     AssetExecutionContext,
     asset,
     asset_check,
-    define_asset_job,
 )
 from mc_postgres_db.models import ProviderAssetMarket
 from mc_postgres_db.operations import set_data
@@ -28,6 +26,9 @@ from dagster_loaders.defs.provider_assets import provider_asset_map
 KRAKEN_POOL: Final[str] = "kraken-api"
 KRAKEN_RATE_LIMIT_SECONDS: Final[float] = 1.0
 BATCH_SIZE: int = 5000
+# 4-hour lookback gives ~7 overlap with the 30-min schedule, so a missed
+# loader run gets backfilled by the next successful one without further work.
+LOOKBACK_MINUTES: Final[int] = 240
 ASSET_PAIRS_URL: Final[str] = "https://api.kraken.com/0/public/AssetPairs"
 OHLC_URL: Final[str] = "https://api.kraken.com/0/public/OHLC"
 
@@ -98,7 +99,16 @@ def kraken_provider_asset_market(
                     f"[{idx}/{total}] Requesting OHLC for {code} ({from_code} -> {to_code})"
                 )
                 time.sleep(KRAKEN_RATE_LIMIT_SECONDS)
-                ohlc_body = _request_kraken(OHLC_URL, params={"pair": code})
+                # Kraken's OHLC defaults to ~720 1-min candles (12h). `since`
+                # caps the response to entries committed after the given unix
+                # timestamp (exclusive), trimming to ~LOOKBACK_MINUTES of data.
+                since_ts = (
+                    int(dt.datetime.now(dt.timezone.utc).timestamp())
+                    - LOOKBACK_MINUTES * 60
+                )
+                ohlc_body = _request_kraken(
+                    OHLC_URL, params={"pair": code, "since": str(since_ts)}
+                )
                 rows = ohlc_body["result"][code]
                 df = pd.DataFrame(
                     rows,
@@ -190,21 +200,7 @@ def kraken_market_data_quality(postgres: PostgresResource) -> AssetCheckResult:
         engine.dispose()
 
 
-kraken_market_job = define_asset_job(
-    name="kraken_market_job",
-    selection=[kraken_provider_asset_market],
-)
-
-kraken_market_schedule = ScheduleDefinition(
-    name="kraken_market_every_30min",
-    cron_schedule="*/30 * * * *",
-    job=kraken_market_job,
-)
-
-
 defs = Definitions(
     assets=[kraken_provider_asset_market],
     asset_checks=[kraken_market_data_quality],
-    jobs=[kraken_market_job],
-    schedules=[kraken_market_schedule],
 )

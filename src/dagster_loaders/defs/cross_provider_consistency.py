@@ -8,7 +8,6 @@ from dagster import (
     AssetSelection,
     AssetCheckResult,
     ScheduleDefinition,
-    DefaultScheduleStatus,
     AssetCheckExecutionContext,
     define_asset_job,
     multi_asset_check,
@@ -77,21 +76,29 @@ def cross_provider_consistency(
         )
 
 
-cross_provider_consistency_job = define_asset_job(
-    name="cross_provider_consistency_job",
-    selection=AssetSelection.checks(cross_provider_consistency),
+# Unified pipeline: all three loaders + their per-provider DQ checks + the
+# cross-provider check, on one 30-min schedule. Dagster orders the assets
+# first, then the cross-provider check (via additional_deps), so the check
+# always runs against the freshest data. The check is a multi_asset_check
+# yielding one result per upstream asset, each routed to that asset's UI page.
+market_data_job = define_asset_job(
+    name="market_data_job",
+    selection=AssetSelection.assets(
+        coinbase_provider_asset_market,
+        kraken_provider_asset_market,
+        okx_provider_asset_market,
+    ),
 )
 
-cross_provider_consistency_schedule = ScheduleDefinition(
-    name="cross_provider_consistency_every_1h",
-    cron_schedule="45 * * * *",
-    job=cross_provider_consistency_job,
-    default_status=DefaultScheduleStatus.STOPPED,
+market_data_schedule = ScheduleDefinition(
+    name="market_data_every_30min",
+    cron_schedule="*/30 * * * *",
+    job=market_data_job,
 )
 
 
 defs = Definitions(
     asset_checks=[cross_provider_consistency],
-    jobs=[cross_provider_consistency_job],
-    schedules=[cross_provider_consistency_schedule],
+    jobs=[market_data_job],
+    schedules=[market_data_schedule],
 )

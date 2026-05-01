@@ -12,12 +12,9 @@ from dagster import (
     FreshnessPolicy,
     AssetCheckResult,
     MaterializeResult,
-    ScheduleDefinition,
     AssetExecutionContext,
-    DefaultScheduleStatus,
     asset,
     asset_check,
-    define_asset_job,
 )
 from mc_postgres_db.models import ProviderAssetMarket
 from mc_postgres_db.operations import set_data
@@ -226,22 +223,7 @@ def okx_market_data_quality(postgres: PostgresResource) -> AssetCheckResult:
         engine.dispose()
 
 
-okx_market_job = define_asset_job(
-    name="okx_market_job",
-    selection=[okx_provider_asset_market],
-)
-
-okx_market_schedule = ScheduleDefinition(
-    name="okx_market_every_30min",
-    cron_schedule="*/30 * * * *",
-    job=okx_market_job,
-    default_status=DefaultScheduleStatus.STOPPED,
-)
-
-
 defs = Definitions(
     assets=[okx_provider_asset_market],
     asset_checks=[okx_market_data_quality],
-    jobs=[okx_market_job],
-    schedules=[okx_market_schedule],
 )
