@@ -24,6 +24,7 @@ def _seed_market_row(
     from_asset_id: int,
     to_asset_id: int,
     close: float,
+    volume: float = 1.0,
 ) -> None:
     session.add(
         ProviderAssetMarket(
@@ -35,7 +36,7 @@ def _seed_market_row(
             high=close,
             low=close,
             close=close,
-            volume=1.0,
+            volume=volume,
         )
     )
 
@@ -446,6 +447,80 @@ def test_median_dilutes_single_misaligned_minute(
     result = cross_provider_consistency_check(postgres_engine)
     assert result.passed is True
     # Many minutes evaluated; median across them is 0 (or near-0).
+    assert result.metadata["pairs_evaluated"].value == 1
+    assert result.metadata["max_pair_median_spread"].value < 0.01
+
+
+def test_low_volume_series_is_excluded(
+    postgres_engine: Engine,
+    coinbase_base_data: dict[str, Any],
+    okx_base_data: dict[str, Any],
+) -> None:
+    """Mirrors the SAND-USDC production case. OKX keeps emitting a frozen
+    `last` price for an inactive market (vol=0 every minute); collapsed via
+    USDT/USDC -> USD it would bias the spread vs Coinbase's active market.
+    The volume filter drops that stale OKX series so the check passes.
+    """
+    anchor = _window_end()
+    with Session(postgres_engine) as session:
+        # OKX USDT collapses to USD via underlying.
+        _link_underlying(
+            session,
+            okx_base_data["usdt_asset_id"],
+            coinbase_base_data["usd_asset_id"],
+        )
+        # Add a USDC asset on OKX that also collapses to USD (mirrors prod).
+        crypto_type = session.execute(
+            select(AssetType).where(AssetType.name == "DIGITAL_CURRENCY")
+        ).scalar_one()
+        usdc = Asset(
+            name="USDC",
+            description="USDC",
+            asset_type_id=crypto_type.id,
+            underlying_asset_id=coinbase_base_data["usd_asset_id"],
+        )
+        session.add(usdc)
+        session.commit()
+        usdc_id = usdc.id
+
+        # Coinbase BTC-USD: active, 60 min of close=78000 with non-zero volume.
+        for offset in range(60):
+            _seed_market_row(
+                session,
+                timestamp=anchor - dt.timedelta(minutes=offset),
+                provider_id=coinbase_base_data["provider_id"],
+                from_asset_id=coinbase_base_data["usd_asset_id"],
+                to_asset_id=coinbase_base_data["btc_asset_id"],
+                close=78000.0,
+                volume=10.0,
+            )
+            # OKX BTC-USDT: active too.
+            _seed_market_row(
+                session,
+                timestamp=anchor - dt.timedelta(minutes=offset),
+                provider_id=okx_base_data["provider_id"],
+                from_asset_id=okx_base_data["usdt_asset_id"],
+                to_asset_id=okx_base_data["btc_asset_id"],
+                close=78050.0,
+                volume=10.0,
+            )
+            # OKX BTC-USDC: STALE — frozen at $90k with zero volume every minute.
+            # Without the volume filter this would dominate the spread.
+            _seed_market_row(
+                session,
+                timestamp=anchor - dt.timedelta(minutes=offset),
+                provider_id=okx_base_data["provider_id"],
+                from_asset_id=usdc_id,
+                to_asset_id=okx_base_data["btc_asset_id"],
+                close=90000.0,
+                volume=0.0,
+            )
+        session.commit()
+
+    result = cross_provider_consistency_check(postgres_engine)
+    assert result.passed is True
+    assert result.metadata["excluded_low_volume_series_count"].value == 1
+    # The two surviving series (Coinbase BTC-USD, OKX BTC-USDT) agree closely.
     assert result.metadata["pairs_evaluated"].value == 1
     assert result.metadata["max_pair_median_spread"].value < 0.01
 

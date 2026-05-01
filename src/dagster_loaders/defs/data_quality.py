@@ -18,6 +18,12 @@ DROP_RATIO: Final[float] = 0.5
 CROSS_PROVIDER_WINDOW_MINUTES: Final[int] = 60
 CROSS_PROVIDER_FFILL_BUFFER_MINUTES: Final[int] = 1440  # 24 hours
 CROSS_PROVIDER_SPREAD_THRESHOLD: Final[float] = 0.10
+# A (provider, raw_pair) series whose total volume across the comparison
+# window is <= this threshold is treated as inactive/stale and excluded.
+# Providers (notably OKX) keep emitting a frozen `last` price for markets
+# that haven't traded in a while; comparing that against actively-traded
+# markets on other providers produces false-positive spreads.
+CROSS_PROVIDER_MIN_WINDOW_VOLUME: Final[float] = 0.0
 FIAT_ASSET_TYPE_NAME: Final[str] = "FIAT_CURRENCY"
 
 
@@ -234,6 +240,7 @@ def cross_provider_consistency_check(
     spread_threshold: float = CROSS_PROVIDER_SPREAD_THRESHOLD,
     window_minutes: int = CROSS_PROVIDER_WINDOW_MINUTES,
     ffill_buffer_minutes: int = CROSS_PROVIDER_FFILL_BUFFER_MINUTES,
+    min_window_volume: float = CROSS_PROVIDER_MIN_WINDOW_VOLUME,
 ) -> AssetCheckResult:
     """Cross-provider close-price consistency guard.
 
@@ -255,6 +262,12 @@ def cross_provider_consistency_check(
     contributes no aligned data and the pair is skipped if fewer than 2
     providers remain. The buffer should comfortably exceed the loader cadence
     (30 min) so a single missed loader run doesn't kick a provider out.
+
+    `min_window_volume` excludes (provider, raw_pair) series whose total
+    volume across the comparison window is at or below the threshold (default
+    0.0, i.e. excludes only completely-no-trade series). Inactive markets
+    keep emitting a frozen `last` price, which would otherwise dominate the
+    cross-provider spread.
 
     Designed to catch ticker-mapping bugs, not market microstructure noise —
     that's why the threshold is loose (10%).
@@ -290,12 +303,15 @@ def cross_provider_consistency_check(
     with Session(engine) as session:
         rows = session.execute(
             select(
+                ProviderAssetMarket.from_asset_id.label("from_asset_id_raw"),
+                ProviderAssetMarket.to_asset_id.label("to_asset_id_raw"),
                 effective_from,
                 effective_to,
                 ProviderAssetMarket.provider_id,
                 Provider.name.label("provider_name"),
                 ProviderAssetMarket.timestamp,
                 ProviderAssetMarket.close,
+                ProviderAssetMarket.volume,
             )
             .join(Provider, Provider.id == ProviderAssetMarket.provider_id)
             .join(from_asset, from_asset.id == ProviderAssetMarket.from_asset_id)
@@ -345,26 +361,100 @@ def cross_provider_consistency_check(
     df = pd.DataFrame(
         rows,
         columns=[
+            "from_asset_id_raw",
+            "to_asset_id_raw",
             "from_asset_id",
             "to_asset_id",
             "provider_id",
             "provider_name",
             "timestamp",
             "close",
+            "volume",
         ],
     )
     df["close"] = df["close"].astype(float)
+    df["volume"] = df["volume"].astype(float)
 
-    # Resolve asset names for the effective ids (after stablecoin collapse) so
-    # the metadata tables aren't just numeric ids.
-    effective_asset_ids = sorted(
-        set(df["from_asset_id"].tolist()) | set(df["to_asset_id"].tolist())
+    # Drop (provider, raw_pair) series whose total volume across the
+    # comparison window (the buffer doesn't count — we judge activity within
+    # the window itself) is at or below `min_window_volume`. Frozen markets
+    # keep emitting their stale `last` price every minute and would otherwise
+    # produce a synthetic spread when collapsed alongside an active sibling
+    # market (e.g., OKX SAND-USDC at $0.082 vs OKX SAND-USDT at $0.072).
+    window_mask = (df["timestamp"] >= window_start) & (df["timestamp"] <= window_end)
+    series_volume = (
+        df[window_mask]
+        .groupby(["provider_id", "from_asset_id_raw", "to_asset_id_raw"])["volume"]
+        .sum()
+    )
+    excluded_series_keys = set(
+        series_volume[series_volume <= min_window_volume].index.tolist()
+    )
+    if excluded_series_keys:
+        # Build a quick mapping for metadata reporting before we drop the rows.
+        excluded_series_records: list[dict[str, Any]] = []
+        for provider_id, raw_from_id, raw_to_id in excluded_series_keys:
+            sample = df[
+                (df["provider_id"] == provider_id)
+                & (df["from_asset_id_raw"] == raw_from_id)
+                & (df["to_asset_id_raw"] == raw_to_id)
+            ]
+            excluded_series_records.append(
+                {
+                    "provider_id": int(provider_id),
+                    "provider_name": sample["provider_name"].iloc[0],
+                    "from_asset_id_raw": int(raw_from_id),
+                    "to_asset_id_raw": int(raw_to_id),
+                    "window_volume": float(
+                        series_volume.get((provider_id, raw_from_id, raw_to_id), 0.0)
+                    ),
+                }
+            )
+        # Drop all rows for excluded series (including buffer rows so they
+        # don't ffill into the grid).
+        keep_mask = ~df.set_index(
+            ["provider_id", "from_asset_id_raw", "to_asset_id_raw"]
+        ).index.isin(excluded_series_keys)
+        df = df[keep_mask].reset_index(drop=True)
+    else:
+        excluded_series_records = []
+
+    # Resolve asset names for both effective and raw ids so metadata tables
+    # aren't just numeric ids. Raw ids appear in the excluded-series table
+    # (USDC, etc.); effective ids appear elsewhere (USD after collapse).
+    relevant_asset_ids = sorted(
+        set(df["from_asset_id"].tolist())
+        | set(df["to_asset_id"].tolist())
+        | {r["from_asset_id_raw"] for r in excluded_series_records}
+        | {r["to_asset_id_raw"] for r in excluded_series_records}
     )
     with Session(engine) as session:
         asset_name_rows = session.execute(
-            select(Asset.id, Asset.name).where(Asset.id.in_(effective_asset_ids))
+            select(Asset.id, Asset.name).where(Asset.id.in_(relevant_asset_ids))
         ).all()
     asset_name_by_id: dict[int, str] = {int(aid): name for aid, name in asset_name_rows}
+
+    excluded_series_df = pd.DataFrame(excluded_series_records)
+    if not excluded_series_df.empty:
+        excluded_series_df["from_asset"] = excluded_series_df["from_asset_id_raw"].map(
+            lambda i: asset_name_by_id.get(int(i), str(i))
+        )
+        excluded_series_df["to_asset"] = excluded_series_df["to_asset_id_raw"].map(
+            lambda i: asset_name_by_id.get(int(i), str(i))
+        )
+        excluded_series_df = excluded_series_df.sort_values(
+            ["provider_name", "from_asset", "to_asset"]
+        )[
+            [
+                "provider_id",
+                "provider_name",
+                "from_asset",
+                "from_asset_id_raw",
+                "to_asset",
+                "to_asset_id_raw",
+                "window_volume",
+            ]
+        ]
 
     # Per-provider stats — surface staleness/coverage at a glance regardless
     # of whether the check passes or fails. Show both id and name.
@@ -435,6 +525,11 @@ def cross_provider_consistency_check(
                 "provider_stats": df_to_md_metadata(
                     provider_stats_df, empty_placeholder="_No rows fetched._"
                 ),
+                "excluded_low_volume_series_count": len(excluded_series_records),
+                "excluded_low_volume_series": df_to_md_metadata(
+                    excluded_series_df, empty_placeholder="_No series excluded._"
+                ),
+                "min_window_volume": MetadataValue.float(min_window_volume),
                 "window_minutes": window_minutes,
                 "ffill_buffer_minutes": ffill_buffer_minutes,
                 "window_start": MetadataValue.text(window_start.isoformat()),
@@ -588,6 +683,12 @@ def cross_provider_consistency_check(
                 provider_stats_df,
                 empty_placeholder="_No rows fetched._",
             ),
+            "excluded_low_volume_series_count": len(excluded_series_records),
+            "excluded_low_volume_series": df_to_md_metadata(
+                excluded_series_df,
+                empty_placeholder="_No series excluded._",
+            ),
+            "min_window_volume": MetadataValue.float(min_window_volume),
             "max_pair_median_spread": MetadataValue.float(
                 round(max(median_spreads), 6) if median_spreads else 0.0
             ),
