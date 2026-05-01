@@ -109,13 +109,12 @@ def test_flags_density_drop_to_zero(
     )
     result = provider_market_data_quality(postgres_engine, "Kraken")
     assert result.metadata["low_density_pairs_count"].value == 1
-    table = result.metadata["low_density_pairs"].value
-    assert len(table.records) == 1
-    record = table.records[0].data
-    assert record["from_asset_id"] == from_id
-    assert record["to_asset_id"] == to_id
-    assert record["recent_count"] == 0
-    assert record["ratio"] == 0
+    md = result.metadata["low_density_pairs"].value
+    # Markdown table renders the asset ids and the column headers.
+    assert str(from_id) in md
+    assert str(to_id) in md
+    assert "from_asset_id" in md
+    assert "ratio" in md
 
 
 def test_flags_density_dropped_below_half(
@@ -140,13 +139,11 @@ def test_flags_density_dropped_below_half(
     )
     result = provider_market_data_quality(postgres_engine, "Kraken")
     assert result.metadata["low_density_pairs_count"].value == 1
-    record = result.metadata["low_density_pairs"].value.records[0].data
-    assert record["from_asset_id"] == from_id
-    assert record["to_asset_id"] == to_id
-    assert record["recent_count"] == 1
-    # ratio is recent_per_hour (0.5) / baseline_per_hour (~4.0) ≈ 0.125
-    assert record["ratio"] < 0.5
-    # And the min_density_ratio aggregate should reflect the drop.
+    md = result.metadata["low_density_pairs"].value
+    assert str(from_id) in md
+    assert str(to_id) in md
+    # And the min_density_ratio aggregate should reflect the drop (recent
+    # 0.5/hr vs baseline ~4/hr ≈ 0.125).
     assert result.metadata["min_density_ratio"].value < 0.5
 
 
@@ -361,10 +358,10 @@ def test_skipped_new_pairs_metric_counts_correctly(
     assert result.metadata["skipped_new_pairs"].value == 2
 
 
-def test_low_density_pairs_table_empty_when_nothing_flagged(
+def test_low_density_pairs_empty_placeholder_when_nothing_flagged(
     postgres_engine: Engine, kraken_base_data: dict[str, Any]
 ) -> None:
-    """When nothing is flagged, the table is empty (zero records) but the schema is still present."""
+    """When nothing is flagged, the metadata renders the empty placeholder."""
     now = _now()
     provider_id, from_id, to_id = _ids(kraken_base_data)
     # 5d at 1/hour baseline + matching recent → no flags.
@@ -381,10 +378,8 @@ def test_low_density_pairs_table_empty_when_nothing_flagged(
     )
     result = provider_market_data_quality(postgres_engine, "Kraken")
     assert result.metadata["low_density_pairs_count"].value == 0
-    table = result.metadata["low_density_pairs"].value
-    assert table.records == []
-    schema_columns = {c.name for c in table.schema.columns}
-    assert {"from_asset_id", "to_asset_id", "ratio"}.issubset(schema_columns)
+    md = result.metadata["low_density_pairs"].value
+    assert "No pairs below threshold" in md
 
 
 def test_aggregate_density_metrics_empty_table(

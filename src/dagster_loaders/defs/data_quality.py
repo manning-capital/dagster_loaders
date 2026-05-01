@@ -2,17 +2,13 @@ import datetime as dt
 import statistics
 from typing import Final, TypedDict
 
-from dagster import (
-    TableColumn,
-    TableRecord,
-    TableSchema,
-    MetadataValue,
-    AssetCheckResult,
-    AssetCheckSeverity,
-)
+import pandas as pd
+from dagster import MetadataValue, AssetCheckResult, AssetCheckSeverity
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 from mc_postgres_db.models import Provider, ProviderAssetMarket
+
+from dagster_loaders.utils import df_to_md_metadata
 
 RECENT_WINDOW_HOURS: Final[int] = 2
 BASELINE_DAYS: Final[int] = 30
@@ -30,25 +26,10 @@ class LowDensityPair(TypedDict):
     ratio: float
 
 
-_LOW_DENSITY_TABLE_SCHEMA: Final[TableSchema] = TableSchema(
-    columns=[
-        TableColumn(name="from_asset_id", type="int"),
-        TableColumn(name="to_asset_id", type="int"),
-        TableColumn(name="provider_id", type="int"),
-        TableColumn(name="recent_count", type="int"),
-        TableColumn(name="recent_per_hour", type="float"),
-        TableColumn(name="baseline_per_hour", type="float"),
-        TableColumn(
-            name="ratio",
-            type="float",
-            description="recent_per_hour / baseline_per_hour",
-        ),
-    ]
-)
-
-
-def _low_density_pairs_table(pairs: list[LowDensityPair]) -> list[TableRecord]:
-    return [TableRecord(dict(p)) for p in sorted(pairs, key=lambda p: p["ratio"])]
+def _low_density_pairs_md(pairs: list[LowDensityPair]) -> MetadataValue:
+    sorted_pairs = sorted(pairs, key=lambda p: p["ratio"])
+    df = pd.DataFrame(sorted_pairs)
+    return df_to_md_metadata(df, empty_placeholder="_No pairs below threshold._")
 
 
 def provider_market_data_quality(
@@ -219,10 +200,7 @@ def provider_market_data_quality(
             "min_close_price": MetadataValue.float(float(min_close or 0.0)),
             "off_minute_rows": off_minute_rows,
             "low_density_pairs_count": len(low_density_pairs),
-            "low_density_pairs": MetadataValue.table(
-                records=_low_density_pairs_table(low_density_pairs),
-                schema=_LOW_DENSITY_TABLE_SCHEMA,
-            ),
+            "low_density_pairs": _low_density_pairs_md(low_density_pairs),
             "skipped_new_pairs": skipped_new_pairs,
             "skipped_sparse_pairs": skipped_sparse_pairs,
             "pairs_evaluated": pairs_evaluated,
