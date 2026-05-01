@@ -331,7 +331,11 @@ def cross_provider_consistency_check(
                 "failing_pairs": df_to_md_metadata(
                     pd.DataFrame(), empty_placeholder="_No pairs evaluated._"
                 ),
+                "provider_stats": df_to_md_metadata(
+                    pd.DataFrame(), empty_placeholder="_No rows fetched._"
+                ),
                 "window_minutes": window_minutes,
+                "ffill_buffer_minutes": ffill_buffer_minutes,
                 "window_start": MetadataValue.text(window_start.isoformat()),
                 "window_end": MetadataValue.text(window_end.isoformat()),
                 "threshold_pct": MetadataValue.float(spread_threshold * 100),
@@ -350,6 +354,42 @@ def cross_provider_consistency_check(
         ],
     )
     df["close"] = df["close"].astype(float)
+
+    # Resolve asset names for the effective ids (after stablecoin collapse) so
+    # the metadata tables aren't just numeric ids.
+    effective_asset_ids = sorted(
+        set(df["from_asset_id"].tolist()) | set(df["to_asset_id"].tolist())
+    )
+    with Session(engine) as session:
+        asset_name_rows = session.execute(
+            select(Asset.id, Asset.name).where(Asset.id.in_(effective_asset_ids))
+        ).all()
+    asset_name_by_id: dict[int, str] = {int(aid): name for aid, name in asset_name_rows}
+
+    # Per-provider stats — surface staleness/coverage at a glance regardless
+    # of whether the check passes or fails. Show both id and name.
+    provider_stats_df = (
+        df.groupby(["provider_id", "provider_name"], as_index=False)
+        .agg(
+            rows=("close", "count"),
+            pairs=(
+                "from_asset_id",
+                lambda s: (
+                    df.loc[s.index, ["from_asset_id", "to_asset_id"]]
+                    .drop_duplicates()
+                    .shape[0]
+                ),
+            ),
+            earliest=("timestamp", "min"),
+            latest=("timestamp", "max"),
+        )
+        .sort_values("provider_name")
+    )
+    provider_stats_df["earliest"] = provider_stats_df["earliest"].astype(str)
+    provider_stats_df["latest"] = provider_stats_df["latest"].astype(str)
+    provider_stats_df = provider_stats_df[
+        ["provider_id", "provider_name", "rows", "pairs", "earliest", "latest"]
+    ]
 
     # Forward-fill each provider's close onto a per-minute grid covering
     # [window_start, window_end]. Rows in the buffer (before window_start) are
@@ -392,6 +432,9 @@ def cross_provider_consistency_check(
                 "failing_pairs": df_to_md_metadata(
                     pd.DataFrame(), empty_placeholder="_No pairs evaluated._"
                 ),
+                "provider_stats": df_to_md_metadata(
+                    provider_stats_df, empty_placeholder="_No rows fetched._"
+                ),
                 "window_minutes": window_minutes,
                 "ffill_buffer_minutes": ffill_buffer_minutes,
                 "window_start": MetadataValue.text(window_start.isoformat()),
@@ -432,11 +475,35 @@ def cross_provider_consistency_check(
     pairs_skipped_single_provider = len(pairs_in_data) - len(pair_agg)
     pairs_evaluated = len(pair_agg)
 
+    # Per-pair stats — analogous to provider_stats: every evaluated pair with
+    # asset names + ids so coverage is scannable even when the check passes.
+    pair_stats_df = pair_agg.copy()
+    pair_stats_df["from_asset"] = pair_stats_df["from_asset_id"].map(
+        lambda i: asset_name_by_id.get(int(i), str(i))
+    )
+    pair_stats_df["to_asset"] = pair_stats_df["to_asset_id"].map(
+        lambda i: asset_name_by_id.get(int(i), str(i))
+    )
+    pair_stats_df["median_spread"] = pair_stats_df["median_spread"].round(4)
+    pair_stats_df["max_spread"] = pair_stats_df["max_spread"].round(4)
+    pair_stats_df = pair_stats_df.sort_values("median_spread", ascending=False)[
+        [
+            "from_asset",
+            "from_asset_id",
+            "to_asset",
+            "to_asset_id",
+            "n_minutes",
+            "median_spread",
+            "max_spread",
+        ]
+    ]
+
     failing_df = pair_agg[pair_agg["median_spread"] > spread_threshold].copy()
     failing_df = failing_df.sort_values("median_spread", ascending=False)
 
-    # Enrich failing pairs with per-provider provider_name list and the latest
-    # observed (timestamp, close) per provider so it's diagnosable at a glance.
+    # Enrich failing pairs with asset names + per-provider provider_name list
+    # and the latest observed (timestamp, close) per provider so it's
+    # diagnosable at a glance from the metadata table.
     if not failing_df.empty:
         latest_obs = (
             df.sort_values("timestamp")
@@ -453,6 +520,12 @@ def cross_provider_consistency_check(
             ].sort_values("provider_name")
             return pd.Series(
                 {
+                    "from_asset": asset_name_by_id.get(
+                        int(row["from_asset_id"]), str(row["from_asset_id"])
+                    ),
+                    "to_asset": asset_name_by_id.get(
+                        int(row["to_asset_id"]), str(row["to_asset_id"])
+                    ),
                     "providers": ", ".join(sub["provider_name"].tolist()),
                     "latest_closes": ", ".join(
                         f"{c:.6g}" for c in sub["close"].tolist()
@@ -470,6 +543,8 @@ def cross_provider_consistency_check(
         )
         failing_df = failing_df[
             [
+                "from_asset",
+                "to_asset",
                 "from_asset_id",
                 "to_asset_id",
                 "providers",
@@ -504,6 +579,14 @@ def cross_provider_consistency_check(
             "failing_pairs_count": len(failing_df),
             "failing_pairs": df_to_md_metadata(
                 failing_df, empty_placeholder="_No pairs above threshold._"
+            ),
+            "pair_stats": df_to_md_metadata(
+                pair_stats_df,
+                empty_placeholder="_No pairs evaluated._",
+            ),
+            "provider_stats": df_to_md_metadata(
+                provider_stats_df,
+                empty_placeholder="_No rows fetched._",
             ),
             "max_pair_median_spread": MetadataValue.float(
                 round(max(median_spreads), 6) if median_spreads else 0.0
