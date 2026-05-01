@@ -12,11 +12,9 @@ from dagster import (
     FreshnessPolicy,
     AssetCheckResult,
     MaterializeResult,
-    ScheduleDefinition,
     AssetExecutionContext,
     asset,
     asset_check,
-    define_asset_job,
 )
 from mc_postgres_db.models import ProviderAssetMarket
 from mc_postgres_db.operations import set_data
@@ -202,21 +200,7 @@ def coinbase_market_data_quality(postgres: PostgresResource) -> AssetCheckResult
         engine.dispose()
 
 
-coinbase_market_job = define_asset_job(
-    name="coinbase_market_job",
-    selection=[coinbase_provider_asset_market],
-)
-
-coinbase_market_schedule = ScheduleDefinition(
-    name="coinbase_market_every_30min",
-    cron_schedule="*/30 * * * *",
-    job=coinbase_market_job,
-)
-
-
 defs = Definitions(
     assets=[coinbase_provider_asset_market],
     asset_checks=[coinbase_market_data_quality],
-    jobs=[coinbase_market_job],
-    schedules=[coinbase_market_schedule],
 )

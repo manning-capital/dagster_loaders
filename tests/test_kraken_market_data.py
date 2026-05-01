@@ -30,7 +30,11 @@ def _stub_kraken(
             responses.GET,
             kraken_market_data.OHLC_URL,
             json={"result": {pair_code: rows}, "error": []},
-            match=[responses.matchers.query_param_matcher({"pair": pair_code})],
+            match=[
+                responses.matchers.query_param_matcher(
+                    {"pair": pair_code}, strict_match=False
+                )
+            ],
         )
 
 

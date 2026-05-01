@@ -1,12 +1,12 @@
 import datetime as dt
 import statistics
-from typing import Final, TypedDict
+from typing import Any, Final, TypedDict
 
 import pandas as pd
 from dagster import MetadataValue, AssetCheckResult, AssetCheckSeverity
-from sqlalchemy import Engine, func, select
-from sqlalchemy.orm import Session
-from mc_postgres_db.models import Provider, ProviderAssetMarket
+from sqlalchemy import Engine, case, func, select
+from sqlalchemy.orm import Session, aliased
+from mc_postgres_db.models import Asset, Provider, AssetType, ProviderAssetMarket
 
 from dagster_loaders.utils import df_to_md_metadata
 
@@ -14,6 +14,17 @@ RECENT_WINDOW_HOURS: Final[int] = 2
 BASELINE_DAYS: Final[int] = 30
 MIN_HISTORY_DAYS: Final[int] = 3
 DROP_RATIO: Final[float] = 0.5
+
+CROSS_PROVIDER_WINDOW_MINUTES: Final[int] = 60
+CROSS_PROVIDER_FFILL_BUFFER_MINUTES: Final[int] = 1440  # 24 hours
+CROSS_PROVIDER_SPREAD_THRESHOLD: Final[float] = 0.10
+# A (provider, raw_pair) series whose total volume across the comparison
+# window is <= this threshold is treated as inactive/stale and excluded.
+# Providers (notably OKX) keep emitting a frozen `last` price for markets
+# that haven't traded in a while; comparing that against actively-traded
+# markets on other providers produces false-positive spreads.
+CROSS_PROVIDER_MIN_WINDOW_VOLUME: Final[float] = 0.0
+FIAT_ASSET_TYPE_NAME: Final[str] = "FIAT_CURRENCY"
 
 
 class LowDensityPair(TypedDict):
@@ -211,5 +222,486 @@ def provider_market_data_quality(
             "pairs_below_75pct": pairs_below_75pct,
             "pairs_below_50pct": pairs_below_50pct,
             "pairs_below_25pct": pairs_below_25pct,
+        },
+    )
+
+
+class CrossProviderFailingPair(TypedDict):
+    from_asset_id: int
+    to_asset_id: int
+    providers: str
+    median_spread: float
+    max_spread: float
+    n_minutes: int
+
+
+def cross_provider_consistency_check(
+    engine: Engine,
+    spread_threshold: float = CROSS_PROVIDER_SPREAD_THRESHOLD,
+    window_minutes: int = CROSS_PROVIDER_WINDOW_MINUTES,
+    ffill_buffer_minutes: int = CROSS_PROVIDER_FFILL_BUFFER_MINUTES,
+    min_window_volume: float = CROSS_PROVIDER_MIN_WINDOW_VOLUME,
+) -> AssetCheckResult:
+    """Cross-provider close-price consistency guard.
+
+    For every (from_asset, to_asset) pair, build a per-minute grid across the
+    `window_minutes` ending at the most recent whole hour, forward-fill each
+    provider's close onto the grid, then per minute compute
+    `(max - min) / median` across providers (only minutes with >=2 providers
+    count). Flag a pair if its **median** per-minute spread exceeds
+    `spread_threshold`. Median across the minute grid is robust to a single
+    misaligned minute — a real ticker-mapping bug stays high every minute, but
+    a transient time-misalignment dilutes.
+
+    Stable coins collapse to their fiat underlying (1 layer, fiat-only — so
+    USDT/USDC -> USD but WBTC stays WBTC).
+
+    `ffill_buffer_minutes` extends the SQL fetch back before `window_start` so
+    the early minutes of the comparison window have a prior observation to
+    forward-fill from. A provider with no rows in the buffer + window simply
+    contributes no aligned data and the pair is skipped if fewer than 2
+    providers remain. The buffer should comfortably exceed the loader cadence
+    (30 min) so a single missed loader run doesn't kick a provider out.
+
+    `min_window_volume` excludes (provider, raw_pair) series whose total
+    volume across the comparison window is at or below the threshold (default
+    0.0, i.e. excludes only completely-no-trade series). Inactive markets
+    keep emitting a frozen `last` price, which would otherwise dominate the
+    cross-provider spread.
+
+    Designed to catch ticker-mapping bugs, not market microstructure noise —
+    that's why the threshold is loose (10%).
+    """
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    window_end = now.replace(minute=0, second=0, microsecond=0)
+    window_start = window_end - dt.timedelta(minutes=window_minutes)
+    fetch_start = window_start - dt.timedelta(minutes=ffill_buffer_minutes)
+
+    from_asset = aliased(Asset)
+    to_asset = aliased(Asset)
+    from_underlying = aliased(Asset)
+    to_underlying = aliased(Asset)
+    from_underlying_type = aliased(AssetType)
+    to_underlying_type = aliased(AssetType)
+
+    # Effective id: collapse to underlying iff underlying.asset_type is fiat.
+    effective_from = case(
+        (
+            from_underlying_type.name == FIAT_ASSET_TYPE_NAME,
+            from_asset.underlying_asset_id,
+        ),
+        else_=from_asset.id,
+    ).label("effective_from_asset_id")
+    effective_to = case(
+        (
+            to_underlying_type.name == FIAT_ASSET_TYPE_NAME,
+            to_asset.underlying_asset_id,
+        ),
+        else_=to_asset.id,
+    ).label("effective_to_asset_id")
+
+    with Session(engine) as session:
+        rows = session.execute(
+            select(
+                ProviderAssetMarket.from_asset_id.label("from_asset_id_raw"),
+                ProviderAssetMarket.to_asset_id.label("to_asset_id_raw"),
+                effective_from,
+                effective_to,
+                ProviderAssetMarket.provider_id,
+                Provider.name.label("provider_name"),
+                ProviderAssetMarket.timestamp,
+                ProviderAssetMarket.close,
+                ProviderAssetMarket.volume,
+            )
+            .join(Provider, Provider.id == ProviderAssetMarket.provider_id)
+            .join(from_asset, from_asset.id == ProviderAssetMarket.from_asset_id)
+            .join(to_asset, to_asset.id == ProviderAssetMarket.to_asset_id)
+            .outerjoin(
+                from_underlying, from_underlying.id == from_asset.underlying_asset_id
+            )
+            .outerjoin(
+                from_underlying_type,
+                from_underlying_type.id == from_underlying.asset_type_id,
+            )
+            .outerjoin(to_underlying, to_underlying.id == to_asset.underlying_asset_id)
+            .outerjoin(
+                to_underlying_type,
+                to_underlying_type.id == to_underlying.asset_type_id,
+            )
+            .where(ProviderAssetMarket.timestamp >= fetch_start)
+            .where(ProviderAssetMarket.timestamp <= window_end)
+        ).all()
+
+    if not rows:
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.WARN,
+            description=(
+                f"no rows in window {window_start.isoformat()} "
+                f"to {window_end.isoformat()}"
+            ),
+            metadata={
+                "pairs_evaluated": 0,
+                "pairs_skipped_single_provider": 0,
+                "failing_pairs_count": 0,
+                "failing_pairs": df_to_md_metadata(
+                    pd.DataFrame(), empty_placeholder="_No pairs evaluated._"
+                ),
+                "provider_stats": df_to_md_metadata(
+                    pd.DataFrame(), empty_placeholder="_No rows fetched._"
+                ),
+                "window_minutes": window_minutes,
+                "ffill_buffer_minutes": ffill_buffer_minutes,
+                "window_start": MetadataValue.text(window_start.isoformat()),
+                "window_end": MetadataValue.text(window_end.isoformat()),
+                "threshold_pct": MetadataValue.float(spread_threshold * 100),
+            },
+        )
+
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "from_asset_id_raw",
+            "to_asset_id_raw",
+            "from_asset_id",
+            "to_asset_id",
+            "provider_id",
+            "provider_name",
+            "timestamp",
+            "close",
+            "volume",
+        ],
+    )
+    df["close"] = df["close"].astype(float)
+    df["volume"] = df["volume"].astype(float)
+
+    # Drop (provider, raw_pair) series whose total volume across the
+    # comparison window (the buffer doesn't count — we judge activity within
+    # the window itself) is at or below `min_window_volume`. Frozen markets
+    # keep emitting their stale `last` price every minute and would otherwise
+    # produce a synthetic spread when collapsed alongside an active sibling
+    # market (e.g., OKX SAND-USDC at $0.082 vs OKX SAND-USDT at $0.072).
+    window_mask = (df["timestamp"] >= window_start) & (df["timestamp"] <= window_end)
+    series_volume = (
+        df[window_mask]
+        .groupby(["provider_id", "from_asset_id_raw", "to_asset_id_raw"])["volume"]
+        .sum()
+    )
+    excluded_series_keys = set(
+        series_volume[series_volume <= min_window_volume].index.tolist()
+    )
+    if excluded_series_keys:
+        # Build a quick mapping for metadata reporting before we drop the rows.
+        excluded_series_records: list[dict[str, Any]] = []
+        for provider_id, raw_from_id, raw_to_id in excluded_series_keys:
+            sample = df[
+                (df["provider_id"] == provider_id)
+                & (df["from_asset_id_raw"] == raw_from_id)
+                & (df["to_asset_id_raw"] == raw_to_id)
+            ]
+            excluded_series_records.append(
+                {
+                    "provider_id": int(provider_id),
+                    "provider_name": sample["provider_name"].iloc[0],
+                    "from_asset_id_raw": int(raw_from_id),
+                    "to_asset_id_raw": int(raw_to_id),
+                    "window_volume": float(
+                        series_volume.get((provider_id, raw_from_id, raw_to_id), 0.0)
+                    ),
+                }
+            )
+        # Drop all rows for excluded series (including buffer rows so they
+        # don't ffill into the grid).
+        keep_mask = ~df.set_index(
+            ["provider_id", "from_asset_id_raw", "to_asset_id_raw"]
+        ).index.isin(excluded_series_keys)
+        df = df[keep_mask].reset_index(drop=True)
+    else:
+        excluded_series_records = []
+
+    # Resolve asset names for both effective and raw ids so metadata tables
+    # aren't just numeric ids. Raw ids appear in the excluded-series table
+    # (USDC, etc.); effective ids appear elsewhere (USD after collapse).
+    relevant_asset_ids = sorted(
+        set(df["from_asset_id"].tolist())
+        | set(df["to_asset_id"].tolist())
+        | {r["from_asset_id_raw"] for r in excluded_series_records}
+        | {r["to_asset_id_raw"] for r in excluded_series_records}
+    )
+    with Session(engine) as session:
+        asset_name_rows = session.execute(
+            select(Asset.id, Asset.name).where(Asset.id.in_(relevant_asset_ids))
+        ).all()
+    asset_name_by_id: dict[int, str] = {int(aid): name for aid, name in asset_name_rows}
+
+    excluded_series_df = pd.DataFrame(excluded_series_records)
+    if not excluded_series_df.empty:
+        excluded_series_df["from_asset"] = excluded_series_df["from_asset_id_raw"].map(
+            lambda i: asset_name_by_id.get(int(i), str(i))
+        )
+        excluded_series_df["to_asset"] = excluded_series_df["to_asset_id_raw"].map(
+            lambda i: asset_name_by_id.get(int(i), str(i))
+        )
+        excluded_series_df = excluded_series_df.sort_values(
+            ["provider_name", "from_asset", "to_asset"]
+        )[
+            [
+                "provider_id",
+                "provider_name",
+                "from_asset",
+                "from_asset_id_raw",
+                "to_asset",
+                "to_asset_id_raw",
+                "window_volume",
+            ]
+        ]
+
+    # Per-provider stats — surface staleness/coverage at a glance regardless
+    # of whether the check passes or fails. Show both id and name.
+    provider_stats_df = (
+        df.groupby(["provider_id", "provider_name"], as_index=False)
+        .agg(
+            rows=("close", "count"),
+            pairs=(
+                "from_asset_id",
+                lambda s: (
+                    df.loc[s.index, ["from_asset_id", "to_asset_id"]]
+                    .drop_duplicates()
+                    .shape[0]
+                ),
+            ),
+            earliest=("timestamp", "min"),
+            latest=("timestamp", "max"),
+        )
+        .sort_values("provider_name")
+    )
+    provider_stats_df["earliest"] = provider_stats_df["earliest"].astype(str)
+    provider_stats_df["latest"] = provider_stats_df["latest"].astype(str)
+    provider_stats_df = provider_stats_df[
+        ["provider_id", "provider_name", "rows", "pairs", "earliest", "latest"]
+    ]
+
+    # Forward-fill each provider's close onto a per-minute grid covering
+    # [window_start, window_end]. Rows in the buffer (before window_start) are
+    # not in the grid but seed the ffill at minute 0.
+    minute_grid = pd.date_range(start=window_start, end=window_end, freq="1min")
+    aligned_records: list[dict[str, Any]] = []
+    for (from_id, to_id, provider_id, provider_name), grp in df.groupby(
+        ["from_asset_id", "to_asset_id", "provider_id", "provider_name"]
+    ):
+        series = grp.set_index("timestamp")["close"].sort_index()
+        series = series[~series.index.duplicated(keep="last")]
+        aligned = series.reindex(
+            series.index.union(minute_grid).sort_values(), method=None
+        ).ffill()
+        aligned = aligned.reindex(minute_grid).dropna()
+        for ts, close in aligned.items():
+            aligned_records.append(
+                {
+                    "from_asset_id": int(from_id),
+                    "to_asset_id": int(to_id),
+                    "provider_id": int(provider_id),
+                    "provider_name": provider_name,
+                    "minute": ts,
+                    "close": float(close),
+                }
+            )
+
+    if not aligned_records:
+        return AssetCheckResult(
+            passed=False,
+            severity=AssetCheckSeverity.WARN,
+            description=(
+                f"no rows in window {window_start.isoformat()} "
+                f"to {window_end.isoformat()} after forward-fill"
+            ),
+            metadata={
+                "pairs_evaluated": 0,
+                "pairs_skipped_single_provider": 0,
+                "failing_pairs_count": 0,
+                "failing_pairs": df_to_md_metadata(
+                    pd.DataFrame(), empty_placeholder="_No pairs evaluated._"
+                ),
+                "provider_stats": df_to_md_metadata(
+                    provider_stats_df, empty_placeholder="_No rows fetched._"
+                ),
+                "excluded_low_volume_series_count": len(excluded_series_records),
+                "excluded_low_volume_series": df_to_md_metadata(
+                    excluded_series_df, empty_placeholder="_No series excluded._"
+                ),
+                "min_window_volume": MetadataValue.float(min_window_volume),
+                "window_minutes": window_minutes,
+                "ffill_buffer_minutes": ffill_buffer_minutes,
+                "window_start": MetadataValue.text(window_start.isoformat()),
+                "window_end": MetadataValue.text(window_end.isoformat()),
+                "threshold_pct": MetadataValue.float(spread_threshold * 100),
+            },
+        )
+
+    aligned_df = pd.DataFrame(aligned_records)
+
+    # Per-minute, per-pair spread across providers.
+    per_minute = aligned_df.groupby(
+        ["from_asset_id", "to_asset_id", "minute"], as_index=False
+    ).agg(
+        n_providers=("close", "count"),
+        max_close=("close", "max"),
+        min_close=("close", "min"),
+        median_close=("close", "median"),
+    )
+    per_minute = per_minute[
+        (per_minute["n_providers"] >= 2) & (per_minute["median_close"] > 0)
+    ].copy()
+    per_minute["spread"] = (
+        per_minute["max_close"] - per_minute["min_close"]
+    ) / per_minute["median_close"]
+
+    # Per-pair: median spread across minutes (robust); also track max for
+    # visibility into transient gaps.
+    pair_agg = per_minute.groupby(["from_asset_id", "to_asset_id"], as_index=False).agg(
+        median_spread=("spread", "median"),
+        max_spread=("spread", "max"),
+        n_minutes=("minute", "count"),
+    )
+
+    # Pairs that appeared in the data but never had >=2 providers at a single
+    # minute -> skipped.
+    pairs_in_data = aligned_df[["from_asset_id", "to_asset_id"]].drop_duplicates()
+    pairs_skipped_single_provider = len(pairs_in_data) - len(pair_agg)
+    pairs_evaluated = len(pair_agg)
+
+    # Per-pair stats — analogous to provider_stats: every evaluated pair with
+    # asset names + ids so coverage is scannable even when the check passes.
+    pair_stats_df = pair_agg.copy()
+    pair_stats_df["from_asset"] = pair_stats_df["from_asset_id"].map(
+        lambda i: asset_name_by_id.get(int(i), str(i))
+    )
+    pair_stats_df["to_asset"] = pair_stats_df["to_asset_id"].map(
+        lambda i: asset_name_by_id.get(int(i), str(i))
+    )
+    pair_stats_df["median_spread"] = pair_stats_df["median_spread"].round(4)
+    pair_stats_df["max_spread"] = pair_stats_df["max_spread"].round(4)
+    pair_stats_df = pair_stats_df.sort_values("median_spread", ascending=False)[
+        [
+            "from_asset",
+            "from_asset_id",
+            "to_asset",
+            "to_asset_id",
+            "n_minutes",
+            "median_spread",
+            "max_spread",
+        ]
+    ]
+
+    failing_df = pair_agg[pair_agg["median_spread"] > spread_threshold].copy()
+    failing_df = failing_df.sort_values("median_spread", ascending=False)
+
+    # Enrich failing pairs with asset names + per-provider provider_name list
+    # and the latest observed (timestamp, close) per provider so it's
+    # diagnosable at a glance from the metadata table.
+    if not failing_df.empty:
+        latest_obs = (
+            df.sort_values("timestamp")
+            .drop_duplicates(
+                subset=["from_asset_id", "to_asset_id", "provider_id"], keep="last"
+            )
+            .copy()
+        )
+
+        def _summarize(row: pd.Series) -> pd.Series:
+            sub = latest_obs[
+                (latest_obs["from_asset_id"] == row["from_asset_id"])
+                & (latest_obs["to_asset_id"] == row["to_asset_id"])
+            ].sort_values("provider_name")
+            return pd.Series(
+                {
+                    "from_asset": asset_name_by_id.get(
+                        int(row["from_asset_id"]), str(row["from_asset_id"])
+                    ),
+                    "to_asset": asset_name_by_id.get(
+                        int(row["to_asset_id"]), str(row["to_asset_id"])
+                    ),
+                    "providers": ", ".join(sub["provider_name"].tolist()),
+                    "latest_closes": ", ".join(
+                        f"{c:.6g}" for c in sub["close"].tolist()
+                    ),
+                    "latest_timestamps": ", ".join(
+                        t.isoformat() for t in sub["timestamp"].tolist()
+                    ),
+                }
+            )
+
+        summary = failing_df.apply(_summarize, axis=1)
+        failing_df = pd.concat(
+            [failing_df.reset_index(drop=True), summary.reset_index(drop=True)],
+            axis=1,
+        )
+        failing_df = failing_df[
+            [
+                "from_asset",
+                "to_asset",
+                "from_asset_id",
+                "to_asset_id",
+                "providers",
+                "latest_closes",
+                "latest_timestamps",
+                "median_spread",
+                "max_spread",
+                "n_minutes",
+            ]
+        ]
+        failing_df["median_spread"] = failing_df["median_spread"].round(4)
+        failing_df["max_spread"] = failing_df["max_spread"].round(4)
+
+    median_spreads = pair_agg["median_spread"].tolist() if pairs_evaluated else []
+
+    description = (
+        "ok"
+        if failing_df.empty
+        else (
+            f"{len(failing_df)} pair(s) median per-minute spread exceeded "
+            f"{int(spread_threshold * 100)}%"
+        )
+    )
+
+    return AssetCheckResult(
+        passed=failing_df.empty,
+        severity=AssetCheckSeverity.WARN,
+        description=description,
+        metadata={
+            "pairs_evaluated": pairs_evaluated,
+            "pairs_skipped_single_provider": pairs_skipped_single_provider,
+            "failing_pairs_count": len(failing_df),
+            "failing_pairs": df_to_md_metadata(
+                failing_df, empty_placeholder="_No pairs above threshold._"
+            ),
+            "pair_stats": df_to_md_metadata(
+                pair_stats_df,
+                empty_placeholder="_No pairs evaluated._",
+            ),
+            "provider_stats": df_to_md_metadata(
+                provider_stats_df,
+                empty_placeholder="_No rows fetched._",
+            ),
+            "excluded_low_volume_series_count": len(excluded_series_records),
+            "excluded_low_volume_series": df_to_md_metadata(
+                excluded_series_df,
+                empty_placeholder="_No series excluded._",
+            ),
+            "min_window_volume": MetadataValue.float(min_window_volume),
+            "max_pair_median_spread": MetadataValue.float(
+                round(max(median_spreads), 6) if median_spreads else 0.0
+            ),
+            "mean_pair_median_spread": MetadataValue.float(
+                round(statistics.fmean(median_spreads), 6) if median_spreads else 0.0
+            ),
+            "median_pair_median_spread": MetadataValue.float(
+                round(statistics.median(median_spreads), 6) if median_spreads else 0.0
+            ),
+            "window_minutes": window_minutes,
+            "ffill_buffer_minutes": ffill_buffer_minutes,
+            "window_start": MetadataValue.text(window_start.isoformat()),
+            "window_end": MetadataValue.text(window_end.isoformat()),
+            "threshold_pct": MetadataValue.float(spread_threshold * 100),
         },
     )
