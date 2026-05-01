@@ -17,7 +17,7 @@ DROP_RATIO: Final[float] = 0.5
 
 CROSS_PROVIDER_WINDOW_MINUTES: Final[int] = 60
 CROSS_PROVIDER_SPREAD_THRESHOLD: Final[float] = 0.10
-FIAT_ASSET_TYPE_NAME: Final[str] = "FiatCurrency"
+FIAT_ASSET_TYPE_NAME: Final[str] = "FIAT_CURRENCY"
 
 
 class LowDensityPair(TypedDict):

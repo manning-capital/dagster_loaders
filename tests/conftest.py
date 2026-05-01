@@ -145,10 +145,10 @@ def kraken_base_data(postgres_engine: Engine) -> dict[str, Any]:
             session.commit()
 
         fiat_type = session.execute(
-            select(AssetType).where(AssetType.name == "FiatCurrency")
+            select(AssetType).where(AssetType.name == "FIAT_CURRENCY")
         ).scalar_one_or_none()
         if fiat_type is None:
-            fiat_type = AssetType(name="FiatCurrency", description="FiatCurrency")
+            fiat_type = AssetType(name="FIAT_CURRENCY", description="FIAT_CURRENCY")
             session.add(fiat_type)
             session.commit()
 
@@ -278,10 +278,10 @@ def coinbase_base_data(postgres_engine: Engine) -> dict[str, Any]:
             session.commit()
 
         fiat_type = session.execute(
-            select(AssetType).where(AssetType.name == "FiatCurrency")
+            select(AssetType).where(AssetType.name == "FIAT_CURRENCY")
         ).scalar_one_or_none()
         if fiat_type is None:
-            fiat_type = AssetType(name="FiatCurrency", description="FiatCurrency")
+            fiat_type = AssetType(name="FIAT_CURRENCY", description="FIAT_CURRENCY")
             session.add(fiat_type)
             session.commit()
 
