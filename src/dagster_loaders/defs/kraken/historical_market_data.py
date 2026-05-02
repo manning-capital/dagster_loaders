@@ -281,9 +281,7 @@ def _materialize_historical(
                         continue
                     base_code, quote_code = pair_codes
                     if base_code not in asset_map or quote_code not in asset_map:
-                        skip_no_asset.append(
-                            f"{altname}({base_code}/{quote_code})"
-                        )
+                        skip_no_asset.append(f"{altname}({base_code}/{quote_code})")
                         continue
                     kept.add(altname)
                 if skip_no_altname or skip_no_asset:
