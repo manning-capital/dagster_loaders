@@ -6,10 +6,19 @@ from typing import Any
 
 import pytest
 import responses
-from dagster import Failure, materialize, build_asset_context
+from dagster import (
+    Failure,
+    DagsterInstance,
+    materialize,
+    build_op_context,
+    build_asset_context,
+)
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 from mc_postgres_db.models import ProviderAssetMarket
+from dagster._core.execution.context.invocation import (
+    DirectAssetCheckExecutionContext,
+)
 
 from dagster_loaders.resources import PostgresResource
 from dagster_loaders.defs.kraken import historical_market_data
@@ -17,8 +26,28 @@ from dagster_loaders.defs.kraken.market_data import ASSET_PAIRS_URL
 from dagster_loaders.defs.kraken.historical_market_data import (
     SA_JSON_ENV_VAR,
     _materialize_historical,
+    check_partition_has_non_zero_volume,
     kraken_provider_asset_market_historical,
+    check_partition_db_count_at_least_materialized,
 )
+
+
+def _build_asset_check_context(
+    *,
+    partition_key: str | None = None,
+    partition_key_range=None,
+    instance: DagsterInstance | None = None,
+) -> DirectAssetCheckExecutionContext:
+    """Build a `DirectAssetCheckExecutionContext` with partition info attached.
+    The public `build_asset_check_context` helper doesn't expose
+    `partition_key`/`partition_key_range`, so we go through `build_op_context`
+    and wrap the result, which is what the public helper does internally."""
+    op_ctx = build_op_context(
+        partition_key=partition_key,
+        partition_key_range=partition_key_range,
+        instance=instance,
+    )
+    return DirectAssetCheckExecutionContext(op_execution_context=op_ctx)
 
 
 def _make_zip(
@@ -370,16 +399,22 @@ def test_errors_when_partition_has_no_data(
     postgres_engine: Engine,
     kraken_base_data: dict[str, Any],
 ) -> None:
-    """A partition with zero matching rows raises Failure listing that date.
-    Drives `_materialize_historical` directly to bypass the asset's
-    RetryPolicy (which would otherwise sleep through 3 retries)."""
+    """A partition with zero matching rows in BOTH the quarterly zip and the
+    full-history fallback raises Failure listing that date. Drives
+    `_materialize_historical` directly to bypass the asset's RetryPolicy
+    (which would otherwise sleep through 3 retries)."""
     base = int(dt.datetime(2024, 1, 15, 12, 0, tzinfo=dt.timezone.utc).timestamp())
     rows = [[base, "1", "1", "1", "1", "1", 1]]
     _stub_asset_pairs({"DOGEUSD": {"base": "DOGE", "quote": "ZUSD"}})
-    _patch_drive(
+    handles = _patch_drive(
         monkeypatch,
         available_quarters={(2024, 1)},
-        zip_bytes_by_label={"Kraken_OHLCVT_Q1_2024.zip": _make_zip({"DOGEUSD": rows})},
+        zip_bytes_by_label={
+            "Kraken_OHLCVT_Q1_2024.zip": _make_zip({"DOGEUSD": rows}),
+            # Full-history fallback also only has the unmapped pair, so the
+            # date stays empty after fallback.
+            "full_history": _make_zip({"DOGEUSD": rows}),
+        },
     )
 
     postgres = PostgresResource(
@@ -392,9 +427,124 @@ def test_errors_when_partition_has_no_data(
             yielded.append(ev)
     assert yielded == []
     assert "2024-01-15" in str(exc_info.value)
+    # Both zips were tried: quarterly first, then full-history as fallback.
+    assert handles["fetch_calls"] == ["Kraken_OHLCVT_Q1_2024.zip", "full_history"]
 
     with Session(postgres_engine) as session:
         assert session.execute(select(ProviderAssetMarket)).scalars().all() == []
+
+
+@responses.activate
+def test_falls_back_to_full_history_when_quarterly_missing_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    postgres_engine: Engine,
+    kraken_base_data: dict[str, Any],
+) -> None:
+    """When a quarterly zip is published but doesn't cover a requested date
+    (e.g., Q1-2023 starts on 2023-01-03), the loader auto-falls-back to the
+    full-history zip for that date in the same run."""
+    boundary = dt.date(2023, 1, 1)
+    boundary_ts = int(
+        dt.datetime(2023, 1, 1, 12, 0, tzinfo=dt.timezone.utc).timestamp()
+    )
+    midquarter_ts = int(
+        dt.datetime(2023, 1, 15, 12, 0, tzinfo=dt.timezone.utc).timestamp()
+    )
+    midquarter = dt.date(2023, 1, 15)
+
+    _stub_asset_pairs({"XBTUSD": {"base": "XXBT", "quote": "ZUSD"}})
+    handles = _patch_drive(
+        monkeypatch,
+        available_quarters={(2023, 1)},
+        zip_bytes_by_label={
+            # Quarterly zip only has the mid-quarter date — boundary date is
+            # missing here.
+            "Kraken_OHLCVT_Q1_2023.zip": _make_zip(
+                {"XBTUSD": [[midquarter_ts, "2", "2", "2", "2", "2", 1]]}
+            ),
+            # Full-history zip covers the boundary date (this mirrors how
+            # Kraken's quarterly export starts a few days into the calendar
+            # quarter).
+            "full_history": _make_zip(
+                {"XBTUSD": [[boundary_ts, "1", "1", "1", "1", "1", 1]]}
+            ),
+        },
+    )
+
+    postgres = PostgresResource(
+        url=postgres_engine.url.render_as_string(hide_password=False)
+    )
+    context = build_asset_context()
+    yielded = list(_materialize_historical(context, postgres, {boundary, midquarter}))
+
+    assert {date for date, _ in yielded} == {boundary, midquarter}
+    # Quarterly tried first, full-history as fallback.
+    assert handles["fetch_calls"] == ["Kraken_OHLCVT_Q1_2023.zip", "full_history"]
+
+    with Session(postgres_engine) as session:
+        rows = session.execute(select(ProviderAssetMarket)).scalars().all()
+        closes_by_date = {r.timestamp.date(): r.close for r in rows}
+        assert closes_by_date[boundary] == 1.0
+        assert closes_by_date[midquarter] == 2.0
+
+
+@responses.activate
+def test_full_history_downloaded_once_when_combining_initial_and_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    postgres_engine: Engine,
+    kraken_base_data: dict[str, Any],
+) -> None:
+    """Backfill spanning a pre-quarterly date (routed to full-history) plus a
+    quarterly boundary date (which falls back to full-history): the
+    full-history zip should download exactly once and cover both."""
+    pre = dt.date(2022, 12, 30)  # routes to full_history (no Q4-2022 quarter)
+    boundary = dt.date(2023, 1, 1)  # routes to quarterly, falls back
+    pre_ts = int(dt.datetime(2022, 12, 30, 12, 0, tzinfo=dt.timezone.utc).timestamp())
+    boundary_ts = int(
+        dt.datetime(2023, 1, 1, 12, 0, tzinfo=dt.timezone.utc).timestamp()
+    )
+    midquarter = dt.date(2023, 1, 15)
+    midquarter_ts = int(
+        dt.datetime(2023, 1, 15, 12, 0, tzinfo=dt.timezone.utc).timestamp()
+    )
+
+    _stub_asset_pairs({"XBTUSD": {"base": "XXBT", "quote": "ZUSD"}})
+    handles = _patch_drive(
+        monkeypatch,
+        available_quarters={(2023, 1)},
+        zip_bytes_by_label={
+            "Kraken_OHLCVT_Q1_2023.zip": _make_zip(
+                {"XBTUSD": [[midquarter_ts, "2", "2", "2", "2", "2", 1]]}
+            ),
+            "full_history": _make_zip(
+                {
+                    "XBTUSD": [
+                        [pre_ts, "1", "1", "1", "1", "1", 1],
+                        [boundary_ts, "3", "3", "3", "3", "3", 1],
+                    ]
+                }
+            ),
+        },
+    )
+
+    postgres = PostgresResource(
+        url=postgres_engine.url.render_as_string(hide_password=False)
+    )
+    context = build_asset_context()
+    yielded = list(
+        _materialize_historical(context, postgres, {pre, boundary, midquarter})
+    )
+
+    assert {date for date, _ in yielded} == {pre, boundary, midquarter}
+    # Quarterly first, then full-history once for both pre and boundary.
+    assert handles["fetch_calls"] == [
+        "Kraken_OHLCVT_Q1_2023.zip",
+        "full_history",
+    ]
+
+    with Session(postgres_engine) as session:
+        rows = session.execute(select(ProviderAssetMarket)).scalars().all()
+        assert len(rows) == 3
 
 
 @responses.activate
@@ -554,3 +704,235 @@ def test_yields_partition_results_incrementally_per_zip(
     )
     assert by_partition[first_date_key] == [first_zip]
     assert by_partition[second_date_key] == [first_zip, second_zip]
+
+
+def _seed_market_rows(
+    engine: Engine,
+    *,
+    provider_id: int,
+    from_asset_id: int,
+    to_asset_id: int,
+    timestamps: list[dt.datetime],
+    volume: float,
+) -> None:
+    with Session(engine) as session:
+        session.add_all(
+            [
+                ProviderAssetMarket(
+                    timestamp=ts,
+                    provider_id=provider_id,
+                    from_asset_id=from_asset_id,
+                    to_asset_id=to_asset_id,
+                    open=1.0,
+                    high=1.0,
+                    low=1.0,
+                    close=1.0,
+                    volume=volume,
+                )
+                for ts in timestamps
+            ]
+        )
+        session.commit()
+
+
+def test_check_passes_when_partition_has_non_zero_volume(
+    postgres_engine: Engine,
+    kraken_base_data: dict[str, Any],
+) -> None:
+    _seed_market_rows(
+        postgres_engine,
+        provider_id=kraken_base_data["provider_id"],
+        from_asset_id=kraken_base_data["usd_asset_id"],
+        to_asset_id=kraken_base_data["btc_asset_id"],
+        timestamps=[
+            dt.datetime(2024, 1, 15, 12, i, tzinfo=dt.timezone.utc) for i in range(3)
+        ],
+        volume=5.0,
+    )
+
+    postgres = PostgresResource(
+        url=postgres_engine.url.render_as_string(hide_password=False)
+    )
+    ctx = _build_asset_check_context(partition_key="2024-01-15")
+    result = check_partition_has_non_zero_volume(ctx, postgres)
+
+    assert result.passed
+    assert result.metadata["non_zero_volume_count"].value == 3
+    assert result.metadata["row_count"].value == 3
+
+
+def test_check_fails_when_partition_has_only_zero_volume(
+    postgres_engine: Engine,
+    kraken_base_data: dict[str, Any],
+) -> None:
+    _seed_market_rows(
+        postgres_engine,
+        provider_id=kraken_base_data["provider_id"],
+        from_asset_id=kraken_base_data["usd_asset_id"],
+        to_asset_id=kraken_base_data["btc_asset_id"],
+        timestamps=[
+            dt.datetime(2024, 1, 15, 12, i, tzinfo=dt.timezone.utc) for i in range(3)
+        ],
+        volume=0.0,
+    )
+
+    postgres = PostgresResource(
+        url=postgres_engine.url.render_as_string(hide_password=False)
+    )
+    ctx = _build_asset_check_context(partition_key="2024-01-15")
+    result = check_partition_has_non_zero_volume(ctx, postgres)
+
+    assert not result.passed
+    assert result.metadata["non_zero_volume_count"].value == 0
+    assert result.metadata["row_count"].value == 3
+
+
+def test_check_aggregates_across_partition_range(
+    postgres_engine: Engine,
+    kraken_base_data: dict[str, Any],
+) -> None:
+    """Multi-partition single-run backfill: the check expands the
+    partition_key_range and reports per-partition counts plus a list of
+    failed partitions."""
+    # Day A: has volume. Day B: only zero volume. Day C: no rows at all.
+    _seed_market_rows(
+        postgres_engine,
+        provider_id=kraken_base_data["provider_id"],
+        from_asset_id=kraken_base_data["usd_asset_id"],
+        to_asset_id=kraken_base_data["btc_asset_id"],
+        timestamps=[dt.datetime(2024, 1, 15, 12, 0, tzinfo=dt.timezone.utc)],
+        volume=5.0,
+    )
+    _seed_market_rows(
+        postgres_engine,
+        provider_id=kraken_base_data["provider_id"],
+        from_asset_id=kraken_base_data["usd_asset_id"],
+        to_asset_id=kraken_base_data["eth_asset_id"],
+        timestamps=[dt.datetime(2024, 1, 16, 12, 0, tzinfo=dt.timezone.utc)],
+        volume=0.0,
+    )
+
+    postgres = PostgresResource(
+        url=postgres_engine.url.render_as_string(hide_password=False)
+    )
+    from dagster import PartitionKeyRange
+
+    ctx = _build_asset_check_context(
+        partition_key_range=PartitionKeyRange(start="2024-01-15", end="2024-01-17")
+    )
+    result = check_partition_has_non_zero_volume(ctx, postgres)
+
+    assert not result.passed
+    assert result.metadata["partition_count"].value == 3
+    assert result.metadata["passed_partition_count"].value == 1
+    assert result.metadata["total_non_zero_volume_count"].value == 1
+    assert result.metadata["total_row_count"].value == 2
+    failed = result.metadata["failed_partitions"].value
+    assert sorted(failed) == ["2024-01-16", "2024-01-17"]
+
+
+@responses.activate
+def test_db_count_check_passes_when_db_matches_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+    postgres_engine: Engine,
+    kraken_base_data: dict[str, Any],
+) -> None:
+    """End-to-end: materialize through the asset (recording `row_count` on the
+    synthetic per-partition materialization via `add_asset_metadata`), then
+    invoke the check directly with the same DagsterInstance — it should find
+    the materialized row_count and verify the DB has at least as many rows."""
+    base = int(dt.datetime(2024, 1, 15, 12, 0, tzinfo=dt.timezone.utc).timestamp())
+    rows = [[base + 60 * i, "100", "100", "100", "100", "5", 1] for i in range(3)]
+    _stub_asset_pairs({"XBTUSD": {"base": "XXBT", "quote": "ZUSD"}})
+    _patch_drive(
+        monkeypatch,
+        available_quarters={(2024, 1)},
+        zip_bytes_by_label={"Kraken_OHLCVT_Q1_2024.zip": _make_zip({"XBTUSD": rows})},
+    )
+
+    instance = DagsterInstance.ephemeral()
+    materialize_result = materialize(
+        [kraken_provider_asset_market_historical],
+        partition_key="2024-01-15",
+        resources={
+            "postgres": PostgresResource(
+                url=postgres_engine.url.render_as_string(hide_password=False)
+            )
+        },
+        instance=instance,
+    )
+    assert materialize_result.success
+
+    postgres = PostgresResource(
+        url=postgres_engine.url.render_as_string(hide_password=False)
+    )
+    ctx = _build_asset_check_context(partition_key="2024-01-15", instance=instance)
+    result = check_partition_db_count_at_least_materialized(ctx, postgres)
+
+    assert result.passed
+    assert result.metadata["materialized_row_count"].value == 3
+    assert result.metadata["db_row_count"].value == 3
+
+
+def test_db_count_check_fails_when_db_count_below_materialized(
+    postgres_engine: Engine,
+    kraken_base_data: dict[str, Any],
+) -> None:
+    """Manually log a materialization claiming 100 rows and seed only 1 row in
+    the DB for that partition: the check should fail because db_count(1) <
+    materialized_row_count(100)."""
+    from dagster import AssetKey, AssetMaterialization
+
+    instance = DagsterInstance.ephemeral()
+    instance.report_runless_asset_event(
+        AssetMaterialization(
+            asset_key=AssetKey("kraken_provider_asset_market_historical"),
+            partition="2024-01-15",
+            metadata={"row_count": 100},
+        )
+    )
+    _seed_market_rows(
+        postgres_engine,
+        provider_id=kraken_base_data["provider_id"],
+        from_asset_id=kraken_base_data["usd_asset_id"],
+        to_asset_id=kraken_base_data["btc_asset_id"],
+        timestamps=[dt.datetime(2024, 1, 15, 12, 0, tzinfo=dt.timezone.utc)],
+        volume=5.0,
+    )
+
+    postgres = PostgresResource(
+        url=postgres_engine.url.render_as_string(hide_password=False)
+    )
+    ctx = _build_asset_check_context(partition_key="2024-01-15", instance=instance)
+    result = check_partition_db_count_at_least_materialized(ctx, postgres)
+
+    assert not result.passed
+    assert result.metadata["materialized_row_count"].value == 100
+    assert result.metadata["db_row_count"].value == 1
+
+
+def test_db_count_check_fails_when_no_materialization_recorded(
+    postgres_engine: Engine,
+    kraken_base_data: dict[str, Any],
+) -> None:
+    """No materialization event for the partition → the check has nothing to
+    compare against and should fail so the user is alerted to investigate."""
+    instance = DagsterInstance.ephemeral()
+    _seed_market_rows(
+        postgres_engine,
+        provider_id=kraken_base_data["provider_id"],
+        from_asset_id=kraken_base_data["usd_asset_id"],
+        to_asset_id=kraken_base_data["btc_asset_id"],
+        timestamps=[dt.datetime(2024, 1, 15, 12, 0, tzinfo=dt.timezone.utc)],
+        volume=5.0,
+    )
+
+    postgres = PostgresResource(
+        url=postgres_engine.url.render_as_string(hide_password=False)
+    )
+    ctx = _build_asset_check_context(partition_key="2024-01-15", instance=instance)
+    result = check_partition_db_count_at_least_materialized(ctx, postgres)
+
+    assert not result.passed
+    assert result.metadata["materialized_row_count"].value is None
+    assert result.metadata["db_row_count"].value == 1
